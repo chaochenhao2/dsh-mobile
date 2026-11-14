@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Mobile bridge",
+    "description": "Serves this Harness to the DSH Mobile iOS app over your local network: list Sessions, follow a transcript live, send prompts, and cancel turns.",
+    "detail": "docs/DETAIL.md"
+  }
+}

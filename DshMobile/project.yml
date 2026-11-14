@@ -1,0 +1,65 @@
+name: DshMobile
+
+options:
+  bundleIdPrefix: com.dshmobile
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+  generateEmptyDirectories: false
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+    DEVELOPMENT_TEAM: ""
+    SWIFT_STRICT_CONCURRENCY: minimal
+
+targets:
+  DshMobile:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - path: DshMobile
+    settings:
+      base:
+        PRODUCT_NAME: DshMobile
+        PRODUCT_BUNDLE_IDENTIFIER: com.dshmobile.app
+        MARKETING_VERSION: "1.0.0"
+        CURRENT_PROJECT_VERSION: "1"
+        TARGETED_DEVICE_FAMILY: "1"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        ENABLE_USER_SCRIPT_SANDBOXING: "YES"
+        SWIFT_EMIT_LOC_STRINGS: "YES"
+    info:
+      path: Support/Info.plist
+      properties:
+        CFBundleDisplayName: DSH Mobile
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSRequiresIPhoneOS: true
+        UIUserInterfaceStyle: Dark
+        UIApplicationSupportsIndirectInputEvents: true
+        UILaunchScreen:
+          UIColorName: LaunchBackground
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        NSLocalNetworkUsageDescription: DSH Mobile 需要访问本地网络，才能找到并控制你电脑上的 DeepSeek Harness。
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+          NSAllowsLocalNetworking: true
+        ITSAppUsesNonExemptEncryption: false
+
+schemes:
+  DshMobile:
+    build:
+      targets:
+        DshMobile: all
+    run:
+      config: Debug
+    archive:
+      config: Release

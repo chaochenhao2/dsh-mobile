@@ -1,0 +1,13 @@
+# The dsh-mobile-bridge bundle patch. It inserts exactly one row: the LAN
+# bridge that the DSH Mobile iOS app talks to. Activation is service-driven, so
+# the row waits for `sessionController` on its own.
+#
+# Configuration is optional and normally unnecessary: on first activation the
+# plugin mints a pairing token and persists its settings to
+# <DSH_HOME>/mobile-bridge/config.json, which is also where a changed port or
+# discovery switch should be edited.
+
+- insert:
+    - id: mobile-bridge
+      name: dsh-mobile-bridge
+      config: {}

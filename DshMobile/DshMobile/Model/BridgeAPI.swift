@@ -1,0 +1,190 @@
+import Foundation
+
+/// A failure the phone can explain to the person holding it.
+enum BridgeError: LocalizedError {
+    case missingEndpoint
+    case invalidURL
+    case http(status: Int, body: String)
+    case transport(String)
+    case decoding(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .missingEndpoint:
+            return "还没有连接到电脑。"
+        case .invalidURL:
+            return "地址无效，请检查主机名与端口。"
+        case let .http(status, body):
+            if status == 401 { return "配对令牌不正确。" }
+            let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? "服务器返回 HTTP \(status)。" : "HTTP \(status)：\(trimmed)"
+        case let .transport(message):
+            return "网络错误：\(message)"
+        case let .decoding(message):
+            return "无法解析响应：\(message)"
+        }
+    }
+}
+
+/// The bridge's JSON and Server-Sent-Events API.
+///
+/// Every call authenticates with the pairing token; the bridge is the only
+/// component that knows how to reach the Harness, so this type stays a thin
+/// transport.
+struct BridgeAPI {
+    let endpoint: Endpoint
+
+    private static let session: URLSession = {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.waitsForConnectivity = false
+        configuration.timeoutIntervalForRequest = 15
+        configuration.timeoutIntervalForResource = 3_600
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        return URLSession(configuration: configuration)
+    }()
+
+    /// The streaming session keeps the request alive while the Harness is quiet.
+    private static let streamingSession: URLSession = {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.waitsForConnectivity = false
+        configuration.timeoutIntervalForRequest = 3_600
+        configuration.timeoutIntervalForResource = 86_400
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        return URLSession(configuration: configuration)
+    }()
+
+    init(endpoint: Endpoint) {
+        self.endpoint = endpoint
+    }
+
+    // MARK: - Requests
+
+    private func makeRequest(_ method: String, _ path: String, body: Data?) throws -> URLRequest {
+        guard let base = endpoint.baseURL else { throw BridgeError.invalidURL }
+        guard let url = URL(string: path, relativeTo: base) else { throw BridgeError.invalidURL }
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        request.setValue("Bearer \(endpoint.token.trimmingCharacters(in: .whitespaces))", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        if let body {
+            request.httpBody = body
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        }
+        return request
+    }
+
+    private func send<T: Decodable>(_ method: String, _ path: String, body: [String: Any]?, session: URLSession) async throws -> T {
+        let payload: Data?
+        if let body {
+            payload = try? JSONSerialization.data(withJSONObject: body)
+        } else {
+            payload = method == "POST" ? Data("{}".utf8) : nil
+        }
+        let request = try makeRequest(method, path, body: payload)
+        do {
+            let (data, response) = try await session.data(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                throw BridgeError.transport("没有收到 HTTP 响应")
+            }
+            guard (200..<300).contains(http.statusCode) else {
+                throw BridgeError.http(status: http.statusCode, body: String(data: data, encoding: .utf8) ?? "")
+            }
+            do {
+                let decoder = JSONDecoder()
+                return try decoder.decode(T.self, from: data)
+            } catch {
+                throw BridgeError.decoding(error.localizedDescription)
+            }
+        } catch let error as BridgeError {
+            throw error
+        } catch {
+            throw BridgeError.transport(error.localizedDescription)
+        }
+    }
+
+    // MARK: - Endpoints
+
+    func info() async throws -> BridgeInfo {
+        try await send("GET", "/api/info", body: nil, session: Self.session)
+    }
+
+    func sessions() async throws -> [SessionRow] {
+        let list: SessionList = try await send("GET", "/api/sessions", body: nil, session: Self.session)
+        return list.items
+    }
+
+    func createSession() async throws -> String {
+        let result: SessionCreateResult = try await send("POST", "/api/sessions", body: [:], session: Self.session)
+        return result.sessionId
+    }
+
+    func detail(sessionID: String) async throws -> SessionDetail {
+        try await send("GET", "/api/session/\(escaped(sessionID))", body: nil, session: Self.session)
+    }
+
+    func prompt(sessionID: String, text: String) async throws {
+        let _: PromptAcceptance = try await send(
+            "POST",
+            "/api/session/\(escaped(sessionID))/prompt",
+            body: ["text": text, "clientTimeZone": TimeZone.current.identifier],
+            session: Self.session
+        )
+    }
+
+    func cancel(sessionID: String) async throws {
+        let _: PromptAcceptance = try await send(
+            "POST",
+            "/api/session/\(escaped(sessionID))/cancel",
+            body: [:],
+            session: Self.session
+        )
+    }
+
+    /// Follow one Session, yielding every operator the bridge emits.
+    ///
+    /// The stream ends normally on cancellation and reports transport or HTTP
+    /// failures through the stream's termination error.
+    /// @param sessionID - Session to follow.
+    /// @returns every decoded frame, in order.
+    func follow(sessionID: String) -> AsyncThrowingStream<StreamFrame, Error> {
+        AsyncThrowingStream(bufferingPolicy: .unbounded) { continuation in
+            let task = Task {
+                do {
+                    let request = try makeRequest(
+                        "GET",
+                        "/api/session/\(escaped(sessionID))/stream?activate=1",
+                        body: nil
+                    )
+                    let (bytes, response) = try await Self.streamingSession.bytes(for: request)
+                    guard let http = response as? HTTPURLResponse else {
+                        throw BridgeError.transport("没有收到 HTTP 响应")
+                    }
+                    guard http.statusCode == 200 else {
+                        throw BridgeError.http(status: http.statusCode, body: "")
+                    }
+                    let decoder = JSONDecoder()
+                    // `AsyncLineSequence` is non-throwing, so the loop carries no `try`.
+                    for await line in bytes.lines {
+                        if Task.isCancelled { break }
+                        guard line.hasPrefix("data:") else { continue }
+                        let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
+                        guard let data = payload.data(using: .utf8) else { continue }
+                        if let frame = try? decoder.decode(StreamFrame.self, from: data) {
+                            continuation.yield(frame)
+                        }
+                    }
+                    continuation.finish()
+                } catch is CancellationError {
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    private func escaped(_ value: String) -> String {
+        value.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? value
+    }
+}

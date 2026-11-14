@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "手机桥接",
+    "description": "把当前 Harness 以局域网 HTTP + SSE 暴露给 DSH Mobile iOS App：列出会话、实时跟随转录、发送 prompt、取消回合。",
+    "detail": "docs/DETAIL.md"
+  }
+}

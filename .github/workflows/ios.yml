@@ -1,0 +1,108 @@
+name: Build unsigned IPA
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "DshMobile/**"
+      - ".github/workflows/ios.yml"
+  pull_request:
+    paths:
+      - "DshMobile/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Cheap gate: catch Swift syntax errors before spending a full Xcode build.
+  parse:
+    name: Parse Swift sources
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse every Swift file
+        run: |
+          set -euo pipefail
+          files=$(find DshMobile/DshMobile -name '*.swift' -print)
+          echo "$files" | sed 's/^/  /'
+          echo "$files" | tr '\n' '\0' | xargs -0 xcrun swiftc -parse
+          echo "swift parse: OK"
+
+  build:
+    name: Build Xcode project
+    needs: parse
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Install XcodeGen
+        run: |
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+          xcodegen --version
+
+      - name: Generate project
+        working-directory: DshMobile
+        run: |
+          set -euo pipefail
+          xcodegen generate
+          xcodebuild -list -project DshMobile.xcodeproj
+
+      - name: Build (unsigned)
+        working-directory: DshMobile
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project DshMobile.xcodeproj \
+            -scheme DshMobile \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build | tee build.log | tail -n 60
+          test -d build/Build/Products/Release-iphoneos/DshMobile.app
+
+      - name: Package IPA
+        working-directory: DshMobile
+        run: |
+          set -euo pipefail
+          APP=build/Build/Products/Release-iphoneos/DshMobile.app
+          version=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP/Info.plist")
+          rm -rf Payload
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          name="DshMobile-${version}-unsigned.ipa"
+          zip -qry "$name" Payload
+          rm -rf Payload
+          ls -lh "$name"
+          echo "IPA=$name" >> "$GITHUB_ENV"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: DshMobile-ipa
+          path: DshMobile/*.ipa
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: DshMobile/build.log
+          if-no-files-found: ignore
