@@ -11,6 +11,8 @@ enum Theme {
     static let textPrimary = Color(white: 0.95)
     static let textSecondary = Color(white: 0.62)
     static let textTertiary = Color(white: 0.42)
+    /// Background behind an inline `code span` inside a message.
+    static let inlineCode = Color(white: 1.0).opacity(0.10)
     static let danger = Color(red: 0.98, green: 0.37, blue: 0.36)
     static let success = Color(red: 0.26, green: 0.85, blue: 0.55)
     static let warning = Color(red: 0.98, green: 0.72, blue: 0.30)

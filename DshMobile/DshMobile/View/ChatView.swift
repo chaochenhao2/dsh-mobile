@@ -123,20 +123,17 @@ struct ChatView: View {
                     .foregroundStyle(Theme.textTertiary)
                 if node.isStreaming {
                     ProgressView()
-                        
                         .tint(Theme.accentAlt)
                 }
-                if node.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    Text("思考中…")
-                        .font(.system(size: 12))
-                        .foregroundStyle(Theme.textTertiary)
-                }
             }
-            Text(node.text)
-                .font(.system(size: 15))
-                .foregroundStyle(Theme.textPrimary)
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            if node.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                Text("思考中…")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.textTertiary)
+            } else {
+                MarkdownView(text: node.text)
+                    .textSelection(.enabled)
+            }
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
