@@ -163,8 +163,9 @@ struct BridgeAPI {
                         throw BridgeError.http(status: http.statusCode, body: "")
                     }
                     let decoder = JSONDecoder()
-                    // `AsyncLineSequence` is non-throwing, so the loop carries no `try`.
-                    for await line in bytes.lines {
+                    // `URLSession.AsyncBytes.lines` is a throwing AsyncSequence on
+                    // every supported deployment target, so the loop needs `try`.
+                    for try await line in bytes.lines {
                         if Task.isCancelled { break }
                         guard line.hasPrefix("data:") else { continue }
                         let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
