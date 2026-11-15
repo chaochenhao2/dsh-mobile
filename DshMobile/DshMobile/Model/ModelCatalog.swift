@@ -71,9 +71,17 @@ struct ModelGroup: Decodable, Identifiable, Equatable {
 
 /// The full picker payload.
 struct ModelCatalog: Decodable, Equatable {
-    let default: Selection
+    /// The deployment default. Named `deploymentDefault` because `default` is a
+    /// Swift keyword; `CodingKeys` maps it back to the wire field.
+    let deploymentDefault: Selection
     let groups: [ModelGroup]
     let failures: [Failure]
+
+    enum CodingKeys: String, CodingKey {
+        case deploymentDefault = "default"
+        case groups
+        case failures
+    }
 
     struct Selection: Decodable, Equatable {
         let provider: String

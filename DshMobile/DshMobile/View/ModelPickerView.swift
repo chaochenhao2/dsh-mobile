@@ -211,7 +211,7 @@ struct ModelPickerView: View {
     private func seedDraft() {
         guard let model = chat.model else {
             // No recorded selection yet: start on the deployment default.
-            if let fallback = chat.catalog?.default {
+            if let fallback = chat.catalog?.deploymentDefault {
                 draftProvider = fallback.provider
                 draftModel = fallback.model
                 draftEffort = fallback.reasoningEffort
