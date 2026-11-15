@@ -233,17 +233,32 @@ function profileName() {
 }
 
 /**
- * Rank a LAN address so a phone dials the routable household address first.
+ * Classify an address so the app can pick the transport that reaches it.
+ *
+ * The phone may be on the same Wi-Fi, joined to a Tailscale tailnet, or dialing
+ * a public relay. The label is advisory: the app dials whatever it is given,
+ * but it can prefer a tailnet address when the home LAN is unreachable.
+ * @param address - dotted IPv4 address.
+ * @returns 'lan', 'tailnet', or 'other'.
+ */
+function addressKind(address) {
+  if (address.startsWith('192.168.')) return 'lan'
+  if (address.startsWith('10.')) return 'lan'
+  if (/^172\.(1[6-9]|2\d|3[01])\./.test(address)) return 'lan'
+  // 100.64/10 is carrier-grade NAT; Tailscale assigns peers from this range.
+  if (/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(address)) return 'tailnet'
+  return 'other'
+}
+
+/**
+ * Rank a dialing candidate so a same-network address is offered first.
  * @param address - dotted IPv4 address.
  * @returns a smaller-is-better rank.
  */
 function addressRank(address) {
-  if (address.startsWith('192.168.')) return 0
-  if (address.startsWith('10.')) return 1
-  if (/^172\.(1[6-9]|2\d|3[01])\./.test(address)) return 2
-  // 100.64/10 is carrier-grade NAT, which shared mesh VPNs also use; it is
-  // reachable from other peers but usually not from a phone on the same Wi-Fi.
-  if (/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(address)) return 8
+  const kind = addressKind(address)
+  if (kind === 'lan') return 0
+  if (kind === 'tailnet') return 1
   if (address.startsWith('169.254.')) return 9
   return 5
 }
@@ -258,7 +273,12 @@ function lanInterfaces() {
   for (const [name, addresses] of Object.entries(interfaces)) {
     for (const address of addresses ?? []) {
       if (address.family !== 'IPv4' || address.internal) continue
-      result.push({ name, address: address.address, netmask: address.netmask })
+      result.push({
+        name,
+        address: address.address,
+        netmask: address.netmask,
+        kind: addressKind(address.address),
+      })
     }
   }
   result.sort((left, right) => addressRank(left.address) - addressRank(right.address))
@@ -403,6 +423,25 @@ function textOfContent(content) {
 }
 
 /**
+ * Join the reasoning blocks of one model-facing content array.
+ *
+ * Reasoning reaches the durable log as its own block type, separate from the
+ * visible text, so the phone shows it as a distinct collapsible section rather
+ * than mixed into the answer.
+ * @param content - the message `content` blocks, possibly absent.
+ * @returns the concatenated reasoning text, or an empty string.
+ */
+function reasoningOfContent(content) {
+  if (!Array.isArray(content)) return ''
+  const parts = []
+  for (const block of content) {
+    if (typeof block !== 'object' || block === null) continue
+    if (block.type === 'reasoning' && typeof block.text === 'string') parts.push(block.text)
+  }
+  return parts.join('\n').trim()
+}
+
+/**
  * Bound one long string so a phone never receives an unbounded tool result.
  * @param text - the raw text.
  * @returns the text, truncated with an explicit marker when too long.
@@ -522,17 +561,23 @@ class Transcript {
     }
     if (frame.type === 'chunk') {
       const chunk = frame.chunk
-      if (typeof chunk !== 'object' || chunk === null || chunk.type !== 'text-delta') return []
+      if (typeof chunk !== 'object' || chunk === null) return []
+      // Both visible text and reasoning stream as deltas; they land in separate
+      // fields of the same provisional node so the app can fold thinking away.
+      const isText = chunk.type === 'text-delta'
+      const isReasoning = chunk.type === 'reasoning-delta'
+      if (!isText && !isReasoning) return []
       const text = typeof chunk.text === 'string' ? chunk.text : ''
       if (text === '') return []
       const id = this.provisional?.id ?? 'a:live'
       const node = this.get(id) ?? {
-        id, role: 'assistant', text: '', ts: Date.now(), seq: null, streaming: true,
+        id, role: 'assistant', text: '', reasoning: '', ts: Date.now(), seq: null, streaming: true,
       }
-      node.text = `${node.text ?? ''}${text}`
+      if (isText) node.text = `${node.text ?? ''}${text}`
+      else node.reasoning = `${node.reasoning ?? ''}${text}`
       node.streaming = true
       this.upsert(node)
-      return [{ op: 'delta', id, text }]
+      return [{ op: 'delta', id, field: isText ? 'text' : 'reasoning', text }]
     }
     if (frame.type === 'end') {
       const outcome = typeof frame.outcome === 'object' && frame.outcome !== null ? frame.outcome.kind : undefined
@@ -581,14 +626,16 @@ class Transcript {
       case 'assistant/message': {
         const message = data.message
         const text = textOfContent(message?.content)
+        const reasoning = reasoningOfContent(message?.content)
         const ops = this.dropProvisional()
-        if (text === '') return ops
+        if (text === '' && reasoning === '') return ops
         const turn = data.turn ?? 0
         const step = data.step ?? 0
         ops.push(this.upsert({
           id: `a:${turn}:${step}`,
           role: 'assistant',
           text,
+          reasoning,
           ts: event.time ?? null,
           seq,
           streaming: false,
@@ -895,6 +942,14 @@ async function infoPayload(ctx, settings) {
       platform: platform(),
       release: release(),
       addresses: addresses.map((entry) => entry.address),
+      // Every dialable candidate with its transport label, so the app can offer
+      // "same Wi-Fi" and "Tailscale" as separate choices instead of guessing.
+      candidates: addresses.map((entry) => ({
+        address: entry.address,
+        kind: entry.kind,
+        interface: entry.name,
+        url: `http://${entry.address}:${settings.port}`,
+      })),
       preferredAddress: preferredAddress(),
       webUrl: safeWebUrl(ctx),
     },
@@ -1030,13 +1085,13 @@ function startBeacon(settings) {
    * Broadcast the current identity to every reachable broadcast address.
    */
   const announce = () => {
-    const addresses = lanInterfaces().map((entry) => entry.address)
+    const addresses = lanInterfaces()
     const payload = Buffer.from(JSON.stringify({
       protocol: PROTOCOL,
       service: 'dsh-mobile-bridge',
       name: hostname(),
-      host: addresses[0] ?? '127.0.0.1',
-      addresses,
+      host: addresses[0]?.address ?? '127.0.0.1',
+      addresses: addresses.map((entry) => entry.address),
       port: settings.port,
       dsh: dshVersion(),
       bridge: BRIDGE_VERSION,

@@ -26,8 +26,8 @@ targets:
       base:
         PRODUCT_NAME: DshMobile
         PRODUCT_BUNDLE_IDENTIFIER: com.dshmobile.app
-        MARKETING_VERSION: "1.1.0"
-        CURRENT_PROJECT_VERSION: "2"
+        MARKETING_VERSION: "1.2.0"
+        CURRENT_PROJECT_VERSION: "3"
         TARGETED_DEVICE_FAMILY: "1"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
@@ -49,9 +49,16 @@ targets:
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
         NSLocalNetworkUsageDescription: DSH Mobile 需要访问本地网络，才能找到并控制你电脑上的 DeepSeek Harness。
+        # ATS: the bridge speaks plain HTTP by design, so every host must be
+        # allowed — LAN, a Tailscale 100.x / .ts.net address, or a public relay.
+        #
+        # NSAllowsLocalNetworking MUST stay absent (or false). When it is true
+        # alongside NSAllowsArbitraryLoads, iOS treats the pair as "local
+        # networking only" and silently blocks every non-local host, which is
+        # exactly what breaks a Tailscale peer. ATS exception domains are not a
+        # substitute: they ignore ports and cannot enumerate arbitrary hosts.
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
-          NSAllowsLocalNetworking: true
         ITSAppUsesNonExemptEncryption: false
 
 schemes:

@@ -28,6 +28,38 @@ struct BridgeInfo: Decodable, Equatable {
         let addresses: [String]
         let preferredAddress: String
         let webUrl: String?
+        /// Every dialable address with its transport label, when the bridge
+        /// reports them. Older bridges omit this and only send `addresses`.
+        let candidates: [Candidate]?
+
+        /// Addresses to try, preferring the one the bridge recommends.
+        var orderedCandidates: [Candidate] {
+            if let candidates, !candidates.isEmpty {
+                let preferred = preferredAddress
+                return candidates.sorted { left, right in
+                    (left.address == preferred ? 0 : 1) < (right.address == preferred ? 0 : 1)
+                }
+            }
+            return addresses.map { Candidate(address: $0, kind: "other", interface: nil, url: nil) }
+        }
+    }
+
+    /// One address the phone can dial, with the network it belongs to.
+    struct Candidate: Decodable, Equatable {
+        let address: String
+        /// `lan` (same Wi-Fi), `tailnet` (Tailscale-style 100.64/10), or `other`.
+        let kind: String
+        let interface: String?
+        let url: String?
+
+        /// How to describe this route to the person choosing it.
+        var label: String {
+            switch kind {
+            case "lan": return "同一 Wi-Fi"
+            case "tailnet": return "Tailscale"
+            default: return "其他网络"
+            }
+        }
     }
 
     let bridge: Bridge
@@ -127,21 +159,37 @@ struct TranscriptNode: Decodable, Identifiable, Equatable {
     let id: String
     let role: Role
     var text: String
+    /// The model's reasoning for this step, when the route produced any.
+    var reasoning: String?
     var streaming: Bool?
     var tool: ToolInfo?
 
     /// Decoded explicitly because `var text` and `let id` are mutated by the
     /// operator fold; providing the initializer keeps memberwise construction
     /// available at call sites while leaving `set` open.
-    init(id: String, role: Role, text: String, streaming: Bool? = nil, tool: ToolInfo? = nil) {
+    init(
+        id: String,
+        role: Role,
+        text: String,
+        reasoning: String? = nil,
+        streaming: Bool? = nil,
+        tool: ToolInfo? = nil
+    ) {
         self.id = id
         self.role = role
         self.text = text
+        self.reasoning = reasoning
         self.streaming = streaming
         self.tool = tool
     }
 
     var isStreaming: Bool { streaming == true }
+
+    /// Reasoning worth showing: non-empty after trimming.
+    var hasReasoning: Bool {
+        guard let reasoning else { return false }
+        return !reasoning.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
 
     /// Whether the turn that produced this node was cut short.
     var isNotice: Bool { role == .notice }
@@ -161,6 +209,8 @@ struct StreamFrame: Decodable {
     let op: String?
     let node: TranscriptNode?
     let id: String?
+    /// Which field a `delta` extends: `text` (default) or `reasoning`.
+    let field: String?
     let text: String?
 
     // `status` frames

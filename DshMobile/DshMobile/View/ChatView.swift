@@ -4,6 +4,8 @@ import SwiftUI
 struct ChatView: View {
     @StateObject private var chat: ChatStore
     @State private var draft = ""
+    /// Node ids whose reasoning section the person opened by hand.
+    @State private var expandedReasoning: Set<String> = []
     @FocusState private var isComposerFocused: Bool
 
     private let title: String
@@ -126,8 +128,11 @@ struct ChatView: View {
                         .tint(Theme.accentAlt)
                 }
             }
+            if node.hasReasoning, let reasoning = node.reasoning {
+                reasoningSection(node, reasoning)
+            }
             if node.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                Text("思考中…")
+                Text(node.isStreaming ? "思考中…" : "（空回复）")
                     .font(.system(size: 12))
                     .foregroundStyle(Theme.textTertiary)
             } else {
@@ -142,6 +147,45 @@ struct ChatView: View {
             RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .strokeBorder(Theme.border, lineWidth: 1)
         )
+    }
+
+    /// Collapsible thinking trace. It stays open while the model is still
+    /// reasoning so the person sees progress, and folds away once the answer
+    /// starts arriving so it does not bury the result.
+    private func reasoningSection(_ node: TranscriptNode, _ reasoning: String) -> some View {
+        let isOpen = expandedReasoning.contains(node.id) || node.isStreaming
+        return VStack(alignment: .leading, spacing: 6) {
+            Button {
+                if expandedReasoning.contains(node.id) {
+                    expandedReasoning.remove(node.id)
+                } else {
+                    expandedReasoning.insert(node.id)
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: isOpen ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 9, weight: .bold))
+                    Text("思考过程")
+                        .font(.system(size: 11, weight: .semibold, design: .rounded))
+                    Text("\(reasoning.count) 字")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(Theme.textTertiary)
+                    Spacer(minLength: 0)
+                }
+                .foregroundStyle(Theme.textSecondary)
+            }
+            .buttonStyle(.plain)
+
+            if isOpen {
+                Text(reasoning)
+                    .font(.system(size: 12.5, design: .monospaced))
+                    .foregroundStyle(Theme.textSecondary)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(10)
+                    .background(Theme.surfaceRaised.opacity(0.55), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            }
+        }
     }
 
     private func toolRow(_ node: TranscriptNode) -> some View {

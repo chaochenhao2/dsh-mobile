@@ -53,6 +53,11 @@ final class AppStore: ObservableObject {
     // MARK: - Connection
 
     /// Pair with the configured endpoint and load its Session list.
+    ///
+    /// When the configured address fails and the bridge is reachable some other
+    /// way, the store retries the remaining candidates — the usual case is a
+    /// phone that left the home Wi-Fi but can still reach the computer over
+    /// Tailscale.
     func connect() async {
         guard let api else {
             lastError = "请填写主机地址与配对令牌。"
@@ -66,10 +71,57 @@ final class AppStore: ObservableObject {
             sessions = try await api.sessions()
             phase = .connected
             persist()
+            return
         } catch {
-            info = nil
-            phase = .idle
             lastError = Self.describe(error)
+        }
+        // The first address failed; walk the alternatives the bridge reported.
+        if let alternatives = await alternateEndpoints(excluding: endpoint.host) {
+            for candidate in alternatives {
+                do {
+                    let probe = BridgeAPI(endpoint: candidate)
+                    info = try await probe.info()
+                    sessions = try await probe.sessions()
+                    endpoint = candidate
+                    phase = .connected
+                    lastError = nil
+                    persist()
+                    return
+                } catch {
+                    lastError = Self.describe(error)
+                }
+            }
+        }
+        info = nil
+        phase = .idle
+    }
+
+    /// Re-run connection using a specific address the person chose.
+    /// @param host - the address to dial, keeping the current port and token.
+    func reconnect(host: String) async {
+        var next = endpoint
+        next.host = host
+        endpoint = next
+        await connect()
+    }
+
+    /// Ask the reachable bridge for its other addresses.
+    ///
+    /// Discovery is best-effort: a bridge that cannot be reached cannot answer,
+    /// so a failure here simply means "no alternatives to try".
+    /// @param excluding - the host already attempted.
+    /// @returns endpoints to try next, or nil when none are known.
+    private func alternateEndpoints(excluding: Set<String>) async -> [Endpoint]? {
+        let probe = BridgeAPI(endpoint: endpoint)
+        guard let reachable = try? await probe.info() else { return nil }
+        let hosts = reachable.host.orderedCandidates
+            .map(\.address)
+            .filter { !excluding.contains($0) }
+        guard !hosts.isEmpty else { return nil }
+        return hosts.map { host in
+            var next = endpoint
+            next.host = host
+            return next
         }
     }
 

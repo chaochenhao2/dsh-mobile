@@ -4,6 +4,7 @@ import SwiftUI
 struct SettingsView: View {
     @EnvironmentObject private var store: AppStore
     @Environment(\.dismiss) private var dismiss
+    @State private var isSwitching = false
 
     var body: some View {
         NavigationStack {
@@ -13,6 +14,7 @@ struct SettingsView: View {
                     VStack(alignment: .leading, spacing: 18) {
                         if let info = store.info {
                             hostCard(info)
+                            routeCard(info)
                             capabilityCard(info)
                         } else {
                             Card {
@@ -61,8 +63,60 @@ struct SettingsView: View {
                 if let web = info.host.webUrl {
                     keyValue("Web GUI", web)
                 }
-                ForEach(info.host.addresses, id: \.self) { address in
-                    keyValue("网卡", address)
+            }
+        }
+    }
+
+    /// Every network this computer is reachable on, with a one-tap switch.
+    ///
+    /// A phone that moves between home Wi-Fi and a tailnet needs this: the
+    /// address that worked on the sofa stops working on cellular, and the
+    /// person should not have to retype anything.
+    private func routeCard(_ info: BridgeInfo) -> some View {
+        Card {
+            VStack(alignment: .leading, spacing: 10) {
+                SectionLabel(text: "可用网络")
+                ForEach(info.host.orderedCandidates, id: \.address) { candidate in
+                    let isCurrent = candidate.address == store.endpoint.host
+                    Button {
+                        guard !isCurrent else { return }
+                        isSwitching = true
+                        Task {
+                            await store.reconnect(host: candidate.address)
+                            isSwitching = false
+                        }
+                    } label: {
+                        HStack(spacing: 10) {
+                            Image(systemName: isCurrent ? "checkmark.circle.fill" : "circle")
+                                .foregroundStyle(isCurrent ? Theme.success : Theme.textTertiary)
+                                .font(.system(size: 13))
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(candidate.label)
+                                    .font(.system(size: 13, weight: .medium))
+                                    .foregroundStyle(Theme.textPrimary)
+                                Text(candidate.address)
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundStyle(Theme.textTertiary)
+                            }
+                            Spacer(minLength: 0)
+                            if isCurrent {
+                                Text("当前")
+                                    .font(.system(size: 10, design: .rounded))
+                                    .foregroundStyle(Theme.success)
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isSwitching || isCurrent)
+                }
+                if isSwitching {
+                    HStack(spacing: 6) {
+                        ProgressView()
+                        Text("切换中…")
+                            .font(.system(size: 11))
+                            .foregroundStyle(Theme.textTertiary)
+                    }
                 }
             }
         }

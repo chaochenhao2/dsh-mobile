@@ -134,11 +134,22 @@ final class ChatStore: ObservableObject {
             nodes.removeAll { $0.id == id }
         case "delta":
             guard let id = frame.id, let text = frame.text else { break }
+            let isReasoning = frame.field == "reasoning"
             if let index = nodes.firstIndex(where: { $0.id == id }) {
-                nodes[index].text += text
+                if isReasoning {
+                    nodes[index].reasoning = (nodes[index].reasoning ?? "") + text
+                } else {
+                    nodes[index].text += text
+                }
                 nodes[index].streaming = true
             } else {
-                var node = TranscriptNode(id: id, role: .assistant, text: text, streaming: true, tool: nil)
+                var node = TranscriptNode(
+                    id: id,
+                    role: .assistant,
+                    text: isReasoning ? "" : text,
+                    reasoning: isReasoning ? text : nil,
+                    streaming: true
+                )
                 node.streaming = true
                 nodes.append(node)
             }
