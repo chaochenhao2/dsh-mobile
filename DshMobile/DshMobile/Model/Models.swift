@@ -205,6 +205,10 @@ struct StreamFrame: Decodable {
     let sessionId: String?
     let cursor: Double?
 
+    /// Authoritative run state carried by a `reset` frame.
+    let running: Bool?
+    let pendingInput: [String]?
+
     // `op` frames
     let op: String?
     let node: TranscriptNode?

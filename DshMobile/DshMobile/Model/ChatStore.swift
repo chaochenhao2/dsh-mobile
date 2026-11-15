@@ -104,13 +104,20 @@ final class ChatStore: ObservableObject {
         switch frame.type {
         case "reset":
             nodes = frame.nodes ?? []
-            isRunning = true
+            // The bridge sends the Session API's own state here. A snapshot is
+            // history: a turn that finished before this connection opened left
+            // no `turn/end` for us to observe, so assuming "running" would be
+            // wrong for most Sessions most of the time.
+            isRunning = frame.running ?? false
+            pendingInput = frame.pendingInput ?? []
+            startedAt = isRunning ? Date() : nil
             lastError = nil
         case "op":
             applyOperator(frame)
             return
         case "status":
             isRunning = (frame.phase == "running")
+            if let pending = frame.pendingInput { pendingInput = pending }
             startedAt = isRunning ? (startedAt ?? Date()) : nil
         case "error":
             lastError = frame.message

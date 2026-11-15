@@ -32,6 +32,8 @@ const DEFAULT_HOST = '0.0.0.0'
 const MAX_BODY_BYTES = 1 << 20
 const MAX_HISTORY_MESSAGES = 400
 const KEEPALIVE_MS = 15_000
+/** How often an open stream reconciles run state with the Session API. */
+const STATE_POLL_MS = 2_000
 const BEACON_INTERVAL_MS = 3_000
 const TOOL_RESULT_CHARS = 4_000
 
@@ -712,6 +714,72 @@ function statusOf(event) {
   return null
 }
 
+/**
+ * Read the authoritative run state of one Session.
+ *
+ * `running` is whether an Agent turn is executing right now; `pendingInput` is
+ * why it may be waiting on a human. Both come from the Session API rather than
+ * from event inference, because a stream that opens mid-turn never sees the
+ * events that preceded it.
+ * @param ctx - the Host plugin context.
+ * @param sessionId - the Session to read.
+ * @param signal - cancellation for the read.
+ * @returns the state, or undefined when the read failed.
+ */
+async function readState(ctx, sessionId, signal) {
+  try {
+    const state = await ctx.sessionController.state({ sessionId }, signal)
+    return {
+      running: state?.running === true,
+      pendingInput: Array.isArray(state?.pendingInput) ? state.pendingInput : [],
+    }
+  } catch (error) {
+    if (signal.aborted) return undefined
+    ctx.logger.warn(`dsh-mobile-bridge: state read failed for ${sessionId}: ${error?.message ?? error}`)
+    return undefined
+  }
+}
+
+/**
+ * Keep the advertised run state accurate while one stream is open.
+ *
+ * Event-derived status is emitted immediately and is usually right, but it
+ * cannot see a turn that was already running when the stream opened, nor one
+ * that settles while the client is reconnecting. A slow poll reconciles the
+ * two and only reports genuine changes.
+ * @param ctx - the Host plugin context.
+ * @param sessionId - the Session being followed.
+ * @param abort - cancellation for this stream.
+ * @param write - the SSE frame writer.
+ * @param initial - the state already sent with the opening snapshot.
+ */
+function startStateWatcher(ctx, sessionId, abort, write, initial) {
+  let lastRunning = initial.running
+  let lastPending = initial.pendingInput
+  const timer = setInterval(() => {
+    if (abort.signal.aborted) {
+      clearInterval(timer)
+      return
+    }
+    void readState(ctx, sessionId, abort.signal).then((state) => {
+      if (state === undefined || abort.signal.aborted) return
+      const pendingChanged = state.pendingInput.join(',') !== lastPending.join(',')
+      if (state.running === lastRunning && !pendingChanged) return
+      lastRunning = state.running
+      lastPending = state.pendingInput
+      write({
+        type: 'status',
+        phase: state.running ? 'running' : 'idle',
+        turn: null,
+        reason: null,
+        pendingInput: state.pendingInput,
+      })
+    })
+  }, STATE_POLL_MS)
+  if (typeof timer.unref === 'function') timer.unref()
+  abort.signal.addEventListener('abort', () => clearInterval(timer), { once: true })
+}
+
 // ---------------------------------------------------------------------------
 // Session reads
 // ---------------------------------------------------------------------------
@@ -1026,10 +1094,17 @@ async function streamSession(ctx, req, res, sessionId, url) {
           if (record?.type !== 'event') continue
           transcript.applyEvent(record.event)
         }
+        // The snapshot is history, not a status claim: a turn that ended before
+        // this connection opened produced its `turn/end` somewhere we never
+        // saw. Ask the Session API for the authoritative state instead of
+        // inferring it, and keep re-reading while the stream is open.
+        const state = await readState(ctx, sessionId, abort.signal)
         write({
           type: 'reset',
           sessionId,
           cursor: frame.cursor ?? null,
+          running: state?.running ?? false,
+          pendingInput: state?.pendingInput ?? [],
           header: {
             id: frame.header?.id ?? sessionId,
             cwd: frame.header?.cwd ?? null,
@@ -1038,6 +1113,7 @@ async function streamSession(ctx, req, res, sessionId, url) {
           },
           nodes: transcript.snapshot(),
         })
+        if (state !== undefined) startStateWatcher(ctx, sessionId, abort, write, state)
         continue
       }
       if (frame.type === 'event') {
