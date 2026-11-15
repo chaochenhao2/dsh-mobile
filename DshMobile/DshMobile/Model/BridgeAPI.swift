@@ -140,6 +140,38 @@ struct BridgeAPI {
         )
     }
 
+    /// The routable model catalog with provider names and effort choices.
+    func models() async throws -> ModelCatalog {
+        try await send("GET", "/api/models", body: nil, session: Self.session)
+    }
+
+    /// Switch one Session to another model.
+    ///
+    /// The Harness records the choice on the Session and saves it as the new
+    /// default, so the next prompt runs on it.
+    /// @param sessionID - Session whose model changes.
+    /// @param provider - provider id.
+    /// @param model - model id.
+    /// @param reasoningEffort - effort id, or nil to leave it to the adapter.
+    /// @returns the selection the Host installed.
+    func selectModel(
+        sessionID: String,
+        provider: String,
+        model: String,
+        reasoningEffort: String?
+    ) async throws -> ModelSwitchResult {
+        var body: [String: Any] = ["provider": provider, "model": model]
+        if let reasoningEffort, !reasoningEffort.isEmpty {
+            body["reasoningEffort"] = reasoningEffort
+        }
+        return try await send(
+            "POST",
+            "/api/session/\(escaped(sessionID))/model",
+            body: body,
+            session: Self.session
+        )
+    }
+
     /// Follow one Session, yielding every operator the bridge emits.
     ///
     /// The stream ends normally on cancellation and reports transport or HTTP

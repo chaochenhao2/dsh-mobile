@@ -6,6 +6,7 @@ struct ChatView: View {
     @State private var draft = ""
     /// Node ids whose reasoning section the person opened by hand.
     @State private var expandedReasoning: Set<String> = []
+    @State private var showsModelPicker = false
     @FocusState private var isComposerFocused: Bool
 
     private let title: String
@@ -33,15 +34,25 @@ struct ChatView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
-                Menu {
-                    Toggle("显示上下文注入", isOn: $chat.showNotices)
-                    Button("重新读取") {
-                        Task { await chat.load() }
+                HStack(spacing: 14) {
+                    Button {
+                        showsModelPicker = true
+                    } label: {
+                        Image(systemName: "cpu")
                     }
-                } label: {
-                    Image(systemName: "ellipsis.circle")
+                    Menu {
+                        Toggle("显示上下文注入", isOn: $chat.showNotices)
+                        Button("重新读取") {
+                            Task { await chat.load() }
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis.circle")
+                    }
                 }
             }
+        }
+        .sheet(isPresented: $showsModelPicker) {
+            ModelPickerView(chat: chat)
         }
         .task {
             await chat.start()
@@ -266,6 +277,18 @@ struct ChatView: View {
                     Text(chat.runningDescription)
                         .font(.system(size: 11, design: .rounded))
                         .foregroundStyle(Theme.textTertiary)
+                }
+                if let model = chat.model {
+                    Text("·").foregroundStyle(Theme.textTertiary)
+                    Button {
+                        showsModelPicker = true
+                    } label: {
+                        Text(model.displayName(in: chat.catalog))
+                            .font(.system(size: 11, weight: .medium, design: .rounded))
+                            .foregroundStyle(Theme.accentAlt)
+                            .lineLimit(1)
+                    }
+                    .buttonStyle(.plain)
                 }
                 Spacer()
                 if !chat.pendingInput.isEmpty {

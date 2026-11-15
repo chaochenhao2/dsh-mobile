@@ -19,6 +19,13 @@ final class ChatStore: ObservableObject {
     @Published private(set) var tick = 0
     @Published var showNotices = false
 
+    /// The model this Session will run its next prompt on.
+    @Published private(set) var model: SessionModel?
+    /// The full catalog, loaded lazily the first time the picker opens.
+    @Published private(set) var catalog: ModelCatalog?
+    @Published private(set) var isLoadingCatalog = false
+    @Published private(set) var isSwitchingModel = false
+
     private let api: BridgeAPI
     private var streamTask: Task<Void, Never>?
     private var startedAt: Date?
@@ -68,6 +75,7 @@ final class ChatStore: ObservableObject {
             nodes = detail.nodes
             isRunning = detail.state.running
             pendingInput = detail.state.pendingInput
+            model = detail.model
             if detail.state.running { startedAt = startedAt ?? Date() }
             lastError = nil
         } catch {
@@ -75,6 +83,50 @@ final class ChatStore: ObservableObject {
         }
         isLoading = false
         tick += 1
+    }
+
+    // MARK: - Model
+
+    /// Load the catalog if it is not already cached.
+    func loadCatalogIfNeeded() async {
+        guard catalog == nil, !isLoadingCatalog else { return }
+        isLoadingCatalog = true
+        defer { isLoadingCatalog = false }
+        do {
+            catalog = try await api.models()
+        } catch {
+            lastError = Self.describe(error)
+        }
+    }
+
+    /// Switch this Session to another model and effort.
+    ///
+    /// The bridge reports the selection it actually installed, which can differ
+    /// from the request when the adapter resolves a default effort, so the
+    /// returned value is what the UI shows.
+    /// @param provider - provider id.
+    /// @param model - model id.
+    /// @param reasoningEffort - effort id, or nil when the model has none.
+    /// @returns whether the switch succeeded.
+    @discardableResult
+    func switchModel(provider: String, model: String, reasoningEffort: String?) async -> Bool {
+        guard !isSwitchingModel else { return false }
+        isSwitchingModel = true
+        defer { isSwitchingModel = false }
+        do {
+            let result = try await api.selectModel(
+                sessionID: sessionID,
+                provider: provider,
+                model: model,
+                reasoningEffort: reasoningEffort
+            )
+            self.model = result.current ?? result.selected
+            lastError = nil
+            return true
+        } catch {
+            lastError = Self.describe(error)
+            return false
+        }
     }
 
     private func follow() {

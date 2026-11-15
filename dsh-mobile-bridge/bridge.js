@@ -785,14 +785,97 @@ function startStateWatcher(ctx, sessionId, abort, write, initial) {
 // ---------------------------------------------------------------------------
 
 /**
+ * Read the model currently selected for one Session, from its durable log.
+ *
+ * The selection is a `model/selection` event, so the last one in the log is the
+ * live answer. Reading the log rather than the projection keeps this correct for
+ * cold Sessions and for Sessions nobody else is observing, and it needs no
+ * activation: a phone can open a finished Session and still see which model it
+ * last ran on.
+ * @param ctx - the Host plugin context.
+ * @param sessionId - the Session to read.
+ * @returns the selection, or null when the Session has none.
+ */
+async function currentSelection(ctx, sessionId) {
+  try {
+    const query = ctx.get('sessionQuery')
+    if (query === undefined) return null
+    // `readSession` returns the full log snapshot with event payloads; the
+    // lighter `listEvents` carries only metadata and no `data` field.
+    const snapshot = await query.readSession(sessionId)
+    let chosen = null
+    for (const event of snapshot?.events ?? []) {
+      if (event?.type !== 'model/selection') continue
+      const data = event.data
+      if (typeof data !== 'object' || data === null) continue
+      if (typeof data.provider !== 'string' || typeof data.model !== 'string') continue
+      chosen = {
+        provider: data.provider,
+        model: data.model,
+        reasoningEffort: typeof data.reasoningEffort === 'string' ? data.reasoningEffort : null,
+      }
+    }
+    return chosen
+  } catch (error) {
+    ctx.logger.warn(`dsh-mobile-bridge: model selection read failed for ${sessionId}: ${error?.message ?? error}`)
+    return null
+  }
+}
+
+/**
+ * Adapt the Host model catalog for a phone picker.
+ *
+ * The Host catalog already groups by provider and carries reasoning efforts;
+ * what the app needs on top is a stable identity per row and the provider's
+ * display name flattened onto it, so a list cell can render without walking
+ * back up the tree.
+ * @param ctx - the Host plugin context.
+ * @param controller - the Host Session API.
+ * @returns the catalog plus the provider-level shape the picker renders.
+ */
+async function modelCatalogFor(ctx, controller) {
+  const catalog = await controller.modelCatalog()
+  const groups = (catalog.groups ?? []).map((group) => ({
+    provider: group.id,
+    providerName: group.name,
+    models: (group.models ?? []).map((model) => ({
+      key: `${group.id}/${model.id}`,
+      id: model.id,
+      name: model.name,
+      description: typeof model.description === 'string' ? model.description : null,
+      badge: model.badge === undefined ? null : model.badge,
+      // An absent `reasoning` means the route exposes no effort choice, which
+      // the picker renders by hiding the control entirely.
+      reasoning: model.reasoning === undefined
+        ? null
+        : {
+          efforts: (model.reasoning.efforts ?? []).map((effort) => ({
+            id: effort.id,
+            name: effort.name,
+            description: typeof effort.description === 'string' ? effort.description : null,
+          })),
+          defaultEffort: typeof model.reasoning.defaultEffort === 'string'
+            ? model.reasoning.defaultEffort
+            : null,
+        },
+    })),
+  }))
+  return {
+    default: catalog.default,
+    routableProviders: catalog.routableProviders ?? [],
+    groups,
+    failures: catalog.failures ?? [],
+  }
+}
+
+/**
  * Read the display title of one Session.
  * @param controller - the Host Session API.
  * @param sessionId - the Session to look up.
  * @param signal - cancellation for the read.
  * @returns the title, or null when unset.
  */
-async function titleOf(controller, sessionId, signal) {
-  const list = await controller.list({}, signal)
+async function titleOf(controller, sessionId, signal) {  const list = await controller.list({}, signal)
   const row = list.items.find((item) => item.sessionId === sessionId)
   const title = row?.projections?.values?.title
   return typeof title === 'string' && title !== '' ? title : null
@@ -883,7 +966,7 @@ async function handleRequest(ctx, settings, req, res) {
       return
     }
     if (segments[1] === 'models' && segments.length === 2) {
-      sendJson(res, 200, await controller.modelCatalog())
+      sendJson(res, 200, await modelCatalogFor(ctx, controller))
       return
     }
     if (segments[1] === 'sessions') {
@@ -915,7 +998,14 @@ async function handleRequest(ctx, settings, req, res) {
           controller.state({ sessionId }, signal),
           titleOf(controller, sessionId, signal),
         ])
-        sendJson(res, 200, { sessionId, title, state, ...page })
+        sendJson(res, 200, {
+          sessionId,
+          title,
+          state,
+          // The model this Session will use for its next prompt.
+          model: await currentSelection(ctx, sessionId),
+          ...page,
+        })
         return
       }
       if (tail === 'stream' && req.method === 'GET') {
@@ -952,14 +1042,17 @@ async function handleRequest(ctx, settings, req, res) {
           sendJson(res, 400, { error: 'bad-request', message: '`provider` and `model` are required.' })
           return
         }
-        sendJson(res, 200, await controller.selectModel({
+        const result = await controller.selectModel({
           sessionId,
           provider: body.provider,
           model: body.model,
           ...(typeof body.reasoningEffort === 'string' && body.reasoningEffort !== ''
             ? { reasoningEffort: body.reasoningEffort }
             : {}),
-        }))
+        })
+        // Re-read the projection so the caller gets the selection that is
+        // actually installed, including an adapter-resolved default effort.
+        sendJson(res, 200, { ...result, current: await currentSelection(ctx, sessionId) })
         return
       }
     }

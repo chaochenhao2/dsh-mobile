@@ -231,6 +231,8 @@ struct SessionDetail: Decodable {
     let sessionId: String
     let title: String?
     let state: SessionState
+    /// The model this Session will run its next prompt on, when it has one.
+    let model: SessionModel?
     let nodes: [TranscriptNode]
     let cursor: Double?
     let hasMore: Bool
@@ -239,6 +241,7 @@ struct SessionDetail: Decodable {
         case sessionId
         case title
         case state
+        case model
         case nodes
         case cursor
         case hasMore
@@ -249,6 +252,7 @@ struct SessionDetail: Decodable {
         sessionId = try container.decode(String.self, forKey: .sessionId)
         title = try? container.decode(String.self, forKey: .title)
         state = try container.decode(SessionState.self, forKey: .state)
+        model = try? container.decode(SessionModel.self, forKey: .model)
         nodes = (try? container.decode([TranscriptNode].self, forKey: .nodes)) ?? []
         cursor = try? container.decode(Double.self, forKey: .cursor)
         hasMore = (try? container.decode(Bool.self, forKey: .hasMore)) ?? false
