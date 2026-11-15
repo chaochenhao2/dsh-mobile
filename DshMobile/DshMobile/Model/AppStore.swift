@@ -76,7 +76,7 @@ final class AppStore: ObservableObject {
             lastError = Self.describe(error)
         }
         // The first address failed; walk the alternatives the bridge reported.
-        if let alternatives = await alternateEndpoints(excluding: endpoint.host) {
+        if let alternatives = await alternateEndpoints(excluding: [endpoint.host]) {
             for candidate in alternatives {
                 do {
                     let probe = BridgeAPI(endpoint: candidate)
