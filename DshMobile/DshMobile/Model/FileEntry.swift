@@ -47,7 +47,9 @@ struct FileListing: Decodable, Equatable {
 
 /// One item held in the app's Documents folder.
 struct DownloadedFile: Identifiable, Equatable {
-    let id = UUID()
+    /// Stable across reloads: `sheet(item:)` rebuilds its content whenever this
+    /// changes, so a fresh UUID per listing would re-present the sheet forever.
+    var id: String { url.lastPathComponent }
     let name: String
     let url: URL
     let bytes: Int

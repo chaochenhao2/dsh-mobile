@@ -1,7 +1,5 @@
 import Foundation
-import SwiftUI
 import UIKit
-import QuickLook
 
 /// Stores downloads in the app's Documents container.
 ///
@@ -104,43 +102,5 @@ enum FileDelivery {
             counter += 1
         }
         return candidate
-    }
-}
-
-/// Presents a document preview for a stored file.
-///
-/// Quick Look is the only way a third-party app can show a PDF, image, archive
-/// listing or plain text with the system's own renderers; rolling per-format
-/// previews would cover a fraction of what people download.
-struct DocumentPreview: UIViewControllerRepresentable {
-    let url: URL
-
-    func makeUIViewController(context: Context) -> QLPreviewController {
-        let controller = QLPreviewController()
-        controller.dataSource = context.coordinator
-        return controller
-    }
-
-    func updateUIViewController(_ controller: QLPreviewController, context: Context) {
-        context.coordinator.url = url
-        controller.reloadData()
-    }
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(url: url)
-    }
-
-    final class Coordinator: NSObject, QLPreviewControllerDataSource {
-        var url: URL
-
-        init(url: URL) {
-            self.url = url
-        }
-
-        func numberOfPreviewItems(in controller: QLPreviewController) -> Int { 1 }
-
-        func previewController(_ controller: QLPreviewController, previewItemAt index: Int) -> QLPreviewItem {
-            url as NSURL
-        }
     }
 }

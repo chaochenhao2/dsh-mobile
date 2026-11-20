@@ -1,11 +1,5 @@
 import SwiftUI
 
-/// Wrapper so a URL can drive `sheet(item:)` without extending Foundation's type.
-struct PreviewTarget: Identifiable {
-    let url: URL
-    var id: String { url.absoluteString }
-}
-
 /// Lists the files this app has downloaded, with preview and delete.
 ///
 /// These are the app's own Documents, so the same files also appear in the
@@ -15,7 +9,7 @@ struct FilesView: View {
     @Environment(\.dismiss) private var dismiss
 
     @State private var files: [DownloadedFile] = []
-    @State private var previewTarget: PreviewTarget?
+    @State private var previewTarget: DownloadedFile?
     @State private var pendingDelete: DownloadedFile?
     @State private var error: String?
 
@@ -32,9 +26,8 @@ struct FilesView: View {
                     Button("关闭") { dismiss() }
                 }
             }
-            .sheet(item: $previewTarget) { target in
-                DocumentPreview(url: target.url)
-                    .ignoresSafeArea()
+            .sheet(item: $previewTarget) { file in
+                FilePreviewView(file: file)
             }
             .confirmationDialog(
                 "删除这个文件？",
@@ -115,7 +108,7 @@ struct FilesView: View {
     private func row(_ file: DownloadedFile) -> some View {
         HStack(spacing: 12) {
             Button {
-                previewTarget = PreviewTarget(url: file.url)
+                previewTarget = file
             } label: {
                 HStack(spacing: 12) {
                     Image(systemName: icon(for: file))
