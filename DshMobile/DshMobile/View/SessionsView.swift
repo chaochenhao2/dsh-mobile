@@ -5,6 +5,7 @@ struct SessionsView: View {
     @EnvironmentObject private var store: AppStore
     @State private var showsSettings = false
     @State private var showsNewSession = false
+    @State private var showsFiles = false
     /// Drives programmatic navigation into a freshly created Session.
     /// iOS 16 has no `navigationDestination(item:)`, so a path is pushed instead.
     @State private var path: [String] = []
@@ -26,16 +27,26 @@ struct SessionsView: View {
                     }
                 }
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        showsNewSession = true
-                    } label: {
-                        Image(systemName: "square.and.pencil")
+                    HStack(spacing: 14) {
+                        Button {
+                            showsFiles = true
+                        } label: {
+                            Image(systemName: "tray.and.arrow.down")
+                        }
+                        Button {
+                            showsNewSession = true
+                        } label: {
+                            Image(systemName: "square.and.pencil")
+                        }
                     }
                 }
             }
             .sheet(isPresented: $showsSettings) {
                 SettingsView()
                     .environmentObject(store)
+            }
+            .sheet(isPresented: $showsFiles) {
+                FilesView()
             }
             .sheet(isPresented: $showsNewSession) {
                 NewSessionView { sessionID in

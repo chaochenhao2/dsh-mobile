@@ -14,6 +14,7 @@ struct FileBrowserView: View {
     @State private var selection: Set<String> = []
     @State private var isDownloading = false
     @State private var downloadNote: String?
+    @State private var showsDownloads = false
 
     var body: some View {
         NavigationStack {
@@ -24,6 +25,9 @@ struct FileBrowserView: View {
             .navigationTitle(title)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { toolbar }
+            .sheet(isPresented: $showsDownloads) {
+                FilesView()
+            }
             .task { await load() }
         }
     }
@@ -198,11 +202,18 @@ struct FileBrowserView: View {
             Button("关闭") { dismiss() }
         }
         ToolbarItem(placement: .topBarTrailing) {
-            Button(isSelecting ? "取消" : "选择") {
-                isSelecting.toggle()
-                if !isSelecting { selection.removeAll() }
+            HStack(spacing: 14) {
+                Button {
+                    showsDownloads = true
+                } label: {
+                    Image(systemName: "tray.and.arrow.down")
+                }
+                Button(isSelecting ? "取消" : "选择") {
+                    isSelecting.toggle()
+                    if !isSelecting { selection.removeAll() }
+                }
+                .disabled(listing == nil)
             }
-            .disabled(listing == nil)
         }
     }
 
@@ -289,13 +300,15 @@ struct FileBrowserView: View {
                     sessionID: sessionID,
                     paths: Array(selection)
                 )
-                guard let file = FileDelivery.stage(data: result.data, name: result.fileName) else {
-                    downloadNote = "无法写入临时文件。"
+                guard let file = FileDelivery.store(data: result.data, name: result.fileName) else {
+                    downloadNote = "无法写入文件。"
                     return
                 }
-                FileDelivery.pruneStaged()
-                downloadNote = "已准备 \(file.name)（\(file.bytes / 1024) KB），请选择“存储到文件”。"
-                FileDelivery.present(file)
+                downloadNote = "已保存 \(file.name)（\(file.sizeText)）"
+                // Leave selection mode so the row list returns to navigation and
+                // the person can keep browsing after a successful download.
+                isSelecting = false
+                selection.removeAll()
             } catch {
                 if RetryPolicy.isCancellation(error) { return }
                 downloadNote = Self.describe(error)

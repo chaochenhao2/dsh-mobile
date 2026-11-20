@@ -45,10 +45,28 @@ struct FileListing: Decodable, Equatable {
     }
 }
 
-/// One item held in the phone's Downloads folder.
+/// One item held in the app's Documents folder.
 struct DownloadedFile: Identifiable, Equatable {
     let id = UUID()
     let name: String
     let url: URL
     let bytes: Int
+    /// When it was written, for ordering.
+    var modified: Date?
+
+    /// A compact size label.
+    var sizeText: String {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        formatter.allowedUnits = [.useKB, .useMB, .useGB]
+        return formatter.string(fromByteCount: Int64(bytes))
+    }
+
+    /// A relative age label.
+    var ageText: String {
+        guard let modified else { return "—" }
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .short
+        return formatter.localizedString(for: modified, relativeTo: Date())
+    }
 }

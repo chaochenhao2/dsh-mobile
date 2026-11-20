@@ -1,32 +1,30 @@
 import Foundation
 import UIKit
+import QuickLook
 
-/// Writes downloads into a temporary directory and hands them to the system.
+/// Stores downloads in the app's Documents container.
 ///
-/// A sandboxed app cannot write to the Files app's Downloads folder directly.
-/// The supported path is the share sheet, which offers "Save to Files" and lets
-/// the person choose where the file lands — including Downloads. The file is
-/// staged in the app's own temporary directory first, because the sheet copies
-/// from a URL it can read.
+/// Because the app declares `UIFileSharingEnabled` and
+/// `LSSupportsOpeningDocumentsInPlace`, this folder is exactly what the Files
+/// app shows under "On My iPhone → DSH Mobile". A sandboxed app cannot write to
+/// the system Downloads folder, but it fully owns this one, so downloads land
+/// without a share-sheet round trip and stay reachable from the Files app.
 enum FileDelivery {
-    /// Directory holding staged downloads.
-    private static var stagingDirectory: URL {
-        FileManager.default.temporaryDirectory.appendingPathComponent("downloads", isDirectory: true)
+    /// The app's Documents directory, created on first use.
+    static var documentsDirectory: URL {
+        let base = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        if !FileManager.default.fileExists(atPath: base.path) {
+            try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        }
+        return base
     }
 
-    /// Write bytes to a unique staged file.
+    /// Write bytes into Documents under a collision-free name.
     /// @param data - the file contents.
-    /// @param name - the file name to present.
-    /// @returns the staged file, or nil when writing failed.
-    static func stage(data: Data, name: String) -> DownloadedFile? {
-        let directory = stagingDirectory
-        do {
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        } catch {
-            return nil
-        }
-        // Keep the original name recognizable while avoiding collisions across
-        // repeated downloads of the same selection.
+    /// @param name - the suggested file name.
+    /// @returns the stored file, or nil when writing failed.
+    static func store(data: Data, name: String) -> DownloadedFile? {
+        let directory = documentsDirectory
         let safeName = sanitize(name)
         let destination = directory.appendingPathComponent(uniqueName(for: safeName))
         do {
@@ -37,43 +35,46 @@ enum FileDelivery {
         return DownloadedFile(name: destination.lastPathComponent, url: destination, bytes: data.count)
     }
 
-    /// Present the system share sheet for one file.
-    /// @param file - the staged file to hand over.
-    static func present(_ file: DownloadedFile) {
-        guard let controller = topViewController() else { return }
-        let activity = UIActivityViewController(activityItems: [file.url], applicationActivities: nil)
-        // iPad requires an anchor or the sheet crashes on presentation.
-        if let popover = activity.popoverPresentationController {
-            popover.sourceView = controller.view
-            popover.sourceRect = CGRect(
-                x: controller.view.bounds.midX,
-                y: controller.view.bounds.midY,
-                width: 0,
-                height: 0
-            )
-            popover.permittedArrowDirections = []
-        }
-        controller.present(activity, animated: true)
-    }
-
-    /// Remove staged files older than one hour.
-    ///
-    /// The share sheet has already copied what it needs, so stale staging is
-    /// only wasted space.
-    static func pruneStaged() {
-        let directory = stagingDirectory
+    /// Every file currently held in Documents, newest first.
+    /// @returns the stored downloads.
+    static func storedFiles() -> [DownloadedFile] {
+        let directory = documentsDirectory
         guard let entries = try? FileManager.default.contentsOfDirectory(
             at: directory,
-            includingPropertiesForKeys: [.contentModificationDateKey]
-        ) else { return }
-        let cutoff = Date().addingTimeInterval(-3_600)
-        for entry in entries {
-            let modified = (try? entry.resourceValues(forKeys: [.contentModificationDateKey]))?
-                .contentModificationDate
-            if let modified, modified < cutoff {
-                try? FileManager.default.removeItem(at: entry)
-            }
+            includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey, .isRegularFileKey]
+        ) else { return [] }
+        return entries.compactMap { url -> DownloadedFile? in
+            let values = try? url.resourceValues(
+                forKeys: [.fileSizeKey, .contentModificationDateKey, .isRegularFileKey]
+            )
+            guard values?.isRegularFile == true else { return nil }
+            return DownloadedFile(
+                name: url.lastPathComponent,
+                url: url,
+                bytes: values?.fileSize ?? 0,
+                modified: values?.contentModificationDate
+            )
         }
+        .sorted { ($0.modified ?? .distantPast) > ($1.modified ?? .distantPast) }
+    }
+
+    /// Delete one stored file.
+    /// @param file - the file to remove.
+    /// @returns whether it is gone.
+    @discardableResult
+    static func delete(_ file: DownloadedFile) -> Bool {
+        do {
+            try FileManager.default.removeItem(at: file.url)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// Total bytes used by stored downloads.
+    /// @returns the sum of file sizes.
+    static var storedBytes: Int {
+        storedFiles().reduce(0) { $0 + $1.bytes }
     }
 
     /// Strip path separators and control characters from a suggested name.
@@ -88,9 +89,9 @@ enum FileDelivery {
 
     /// Insert a counter before the extension when the name is taken.
     /// @param name - the desired file name.
-    /// @returns a name not yet present in the staging directory.
+    /// @returns a name not yet present in Documents.
     private static func uniqueName(for name: String) -> String {
-        let directory = stagingDirectory
+        let directory = documentsDirectory
         var candidate = name
         var counter = 1
         let base = (name as NSString).deletingPathExtension
@@ -103,19 +104,42 @@ enum FileDelivery {
         }
         return candidate
     }
+}
 
-    /// Find the controller a sheet can be presented from.
-    /// @returns the top-most presented controller.
-    private static func topViewController() -> UIViewController? {
-        let scenes = UIApplication.shared.connectedScenes
-        guard let windowScene = scenes.first(where: { $0.activationState == .foregroundActive }) as? UIWindowScene,
-              let window = windowScene.windows.first(where: { $0.isKeyWindow }) else {
-            return nil
-        }
-        var controller = window.rootViewController
-        while let presented = controller?.presentedViewController {
-            controller = presented
-        }
+/// Presents a document preview for a stored file.
+///
+/// Quick Look is the only way a third-party app can show a PDF, image, archive
+/// listing or plain text with the system's own renderers; rolling per-format
+/// previews would cover a fraction of what people download.
+struct DocumentPreview: UIViewControllerRepresentable {
+    let url: URL
+
+    func makeUIViewController(context: Context) -> QLPreviewController {
+        let controller = QLPreviewController()
+        controller.dataSource = context.coordinator
         return controller
+    }
+
+    func updateUIViewController(_ controller: QLPreviewController, context: Context) {
+        context.coordinator.url = url
+        controller.reloadData()
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(url: url)
+    }
+
+    final class Coordinator: NSObject, QLPreviewControllerDataSource {
+        var url: URL
+
+        init(url: URL) {
+            self.url = url
+        }
+
+        func numberOfPreviewItems(in controller: QLPreviewController) -> Int { 1 }
+
+        func previewController(_ controller: QLPreviewController, previewItemAt index: Int) -> QLPreviewItem {
+            url as NSURL
+        }
     }
 }
