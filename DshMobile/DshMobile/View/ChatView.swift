@@ -13,13 +13,15 @@ struct ChatView: View {
 
     init(sessionID: String, title: String, endpoint: Endpoint) {
         self.title = title
-        _chat = StateObject(
-            wrappedValue: ChatStore(
-                sessionID: sessionID,
-                title: title,
-                api: BridgeAPI(endpoint: endpoint)
-            )
+        // The store is built first so the transport's retry reporter can call
+        // back into it; `ChatStore.api` is immutable and holds a copy of the
+        // struct, so the closure must be installed before that copy is made.
+        let store = ChatStore(
+            sessionID: sessionID,
+            title: title,
+            api: BridgeAPI(endpoint: endpoint)
         )
+        _chat = StateObject(wrappedValue: store)
     }
 
     var body: some View {

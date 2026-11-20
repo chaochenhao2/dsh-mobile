@@ -31,7 +31,8 @@ final class ChatStore: ObservableObject {
     @Published private(set) var isLoadingCatalog = false
     @Published private(set) var isSwitchingModel = false
 
-    private let api: BridgeAPI
+    // Mutable so the retry reporter can be installed after construction.
+    private var api: BridgeAPI
     private var streamTask: Task<Void, Never>?
     private var startedAt: Date?
 
@@ -41,19 +42,26 @@ final class ChatStore: ObservableObject {
         self.api = api
     }
 
-    /// Replace the API with one whose retry reporter feeds this store.
+    /// Attach the transport's retry reporter to this store.
     ///
-    /// The reporter is attached after initialization because it captures `self`;
-    /// a stored property cannot reference the instance being built.
+    /// Called once before the first request. The API value is copied into the
+    /// store at initialization, so the reporter is installed on that same copy
+    /// by rebuilding it here with a callback that targets this instance.
     func attachRetryReporter() {
         api.onRetry = { [weak self] attempt, error in
             Task { @MainActor in
-                guard let self else { return }
-                self.retryCount = attempt
-                self.isRetrying = true
-                self.lastRetryReason = Self.describe(error)
+                self?.noteRetry(attempt: attempt, error: error)
             }
         }
+    }
+
+    /// Record a retry observed by the transport.
+    /// @param attempt - how many attempts have failed so far.
+    /// @param error - the failure that triggered the retry.
+    func noteRetry(attempt: Int, error: Error) {
+        retryCount = attempt
+        isRetrying = attempt > 0
+        lastRetryReason = Self.describe(error)
     }
 
     /// Record that the in-flight request finally succeeded or gave up.
