@@ -90,6 +90,29 @@ struct SessionRow: Decodable, Identifiable, Equatable {
     let agentAvailable: Bool
     let origin: String?
 
+    /// Memberwise construction for rows the app synthesizes itself, such as the
+    /// optimistic row used to navigate into a Session the list has not caught up
+    /// with yet.
+    init(
+        id: String,
+        title: String,
+        updatedAt: Double?,
+        running: Bool,
+        blank: Bool,
+        cwd: String?,
+        agentAvailable: Bool,
+        origin: String?
+    ) {
+        self.id = id
+        self.title = title
+        self.updatedAt = updatedAt
+        self.running = running
+        self.blank = blank
+        self.cwd = cwd
+        self.agentAvailable = agentAvailable
+        self.origin = origin
+    }
+
     /// Relative age, for a list row subtitle.
     var ageText: String {
         guard let updatedAt else { return "—" }
@@ -233,6 +256,8 @@ struct SessionDetail: Decodable {
     let state: SessionState
     /// The model this Session will run its next prompt on, when it has one.
     let model: SessionModel?
+    /// Permission presets for this Session; nil when the Harness has none.
+    let permissions: PermissionsPayload?
     let nodes: [TranscriptNode]
     let cursor: Double?
     let hasMore: Bool
@@ -242,6 +267,7 @@ struct SessionDetail: Decodable {
         case title
         case state
         case model
+        case permissions
         case nodes
         case cursor
         case hasMore
@@ -253,6 +279,7 @@ struct SessionDetail: Decodable {
         title = try? container.decode(String.self, forKey: .title)
         state = try container.decode(SessionState.self, forKey: .state)
         model = try? container.decode(SessionModel.self, forKey: .model)
+        permissions = try? container.decode(PermissionsPayload.self, forKey: .permissions)
         nodes = (try? container.decode([TranscriptNode].self, forKey: .nodes)) ?? []
         cursor = try? container.decode(Double.self, forKey: .cursor)
         hasMore = (try? container.decode(Bool.self, forKey: .hasMore)) ?? false

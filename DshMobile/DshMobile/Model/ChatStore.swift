@@ -26,6 +26,9 @@ final class ChatStore: ObservableObject {
 
     /// The model this Session will run its next prompt on.
     @Published private(set) var model: SessionModel?
+    /// Permission presets available to this Session, and its current one.
+    @Published private(set) var permissions: PermissionsPayload?
+    @Published private(set) var isSwitchingPermission = false
     /// The full catalog, loaded lazily the first time the picker opens.
     @Published private(set) var catalog: ModelCatalog?
     @Published private(set) var isLoadingCatalog = false
@@ -113,6 +116,7 @@ final class ChatStore: ObservableObject {
             isRunning = detail.state.running
             pendingInput = detail.state.pendingInput
             model = detail.model
+            permissions = detail.permissions
             if detail.state.running { startedAt = startedAt ?? Date() }
             lastError = nil
             clearRetryState()
@@ -135,6 +139,28 @@ final class ChatStore: ObservableObject {
             clearRetryState()
         } catch {
             lastError = Self.describe(error)
+        }
+    }
+
+    /// Switch this Session's permission preset.
+    ///
+    /// Only this Session changes: the Harness default for future Sessions is
+    /// untouched, which is what the person expects from a per-Session control.
+    /// @param value - preset value from the catalog.
+    /// @returns whether the switch succeeded.
+    @discardableResult
+    func switchPermission(_ value: String) async -> Bool {
+        guard !isSwitchingPermission else { return false }
+        isSwitchingPermission = true
+        defer { isSwitchingPermission = false }
+        do {
+            permissions = try await api.setPermission(sessionID: sessionID, value: value)
+            lastError = nil
+            clearRetryState()
+            return true
+        } catch {
+            lastError = Self.describe(error)
+            return false
         }
     }
 

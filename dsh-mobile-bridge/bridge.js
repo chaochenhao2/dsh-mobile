@@ -901,6 +901,148 @@ function summarize(row) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Workspaces, agent modes, and permissions
+// ---------------------------------------------------------------------------
+
+/**
+ * Read every durable workspace.
+ *
+ * A new Session is anchored to one: either an existing workspace or a directory
+ * the person names. The phone needs both the list and each workspace's health,
+ * because a workspace whose directory disappeared cannot host a new Session.
+ * @param ctx - the Host plugin context.
+ * @returns one row per workspace, plus the process default directory.
+ */
+async function workspacesPayload(ctx) {
+  const registry = ctx.get('workspaceRegistry')
+  const rows = []
+  if (registry !== undefined) {
+    for (const workspace of registry.list()) {
+      let status = 'unknown'
+      try {
+        status = await workspace.status()
+      } catch (error) {
+        ctx.logger.warn(`dsh-mobile-bridge: workspace status failed for ${workspace.id}: ${error?.message ?? error}`)
+      }
+      rows.push({
+        id: workspace.id,
+        path: workspace.path,
+        title: workspace.title,
+        createdAt: typeof workspace.createdAt === 'string' ? workspace.createdAt : null,
+        updatedAt: typeof workspace.updatedAt === 'string' ? workspace.updatedAt : null,
+        status,
+        sessionCount: Array.isArray(workspace.sessionIds) ? workspace.sessionIds.length : 0,
+      })
+    }
+  }
+  const working = ctx.get('workingDirectory')
+  let defaultDirectory = null
+  try {
+    defaultDirectory = typeof working?.defaultDirectory === 'string' ? working.defaultDirectory : null
+  } catch {
+    // A composition without a working-directory service has no opinion here.
+  }
+  return { workspaces: rows, defaultDirectory }
+}
+
+/**
+ * Read the selectable agent modes and which one is the current default.
+ *
+ * The shipped roster carries `standard`, `ptc`, `minimal` and `cordis`; their
+ * display copy lives in dictionaries keyed by id, because a shipped preset
+ * publishes no name of its own. The phone gets resolved labels so it never has
+ * to know that rule.
+ * @param ctx - the Host plugin context.
+ * @returns modes in roster order, marking the selected default.
+ */
+async function presetsPayload(ctx) {
+  const registry = ctx.get('agentPresets')
+  if (registry === undefined) return { modes: [], selectedDefault: null }
+  let roster = []
+  try {
+    roster = await registry.list()
+  } catch (error) {
+    ctx.logger.warn(`dsh-mobile-bridge: preset roster failed: ${error?.message ?? error}`)
+  }
+  const builtInNames = {
+    standard: '普通',
+    ptc: 'PTC',
+    minimal: '极简',
+    cordis: '创造',
+  }
+  const builtInDescriptions = {
+    standard: '完整能力：文件、命令、搜索、子代理与工作流。',
+    ptc: '以代码方式调用工具，适合批量操作。',
+    minimal: '只保留最基本的对话与工具。',
+    cordis: '可自我扩展，能编写并加载新插件。',
+  }
+  let selectedDefault = null
+  try {
+    const settings = ctx.get('agentPresetRegistrySettings')
+    if (settings !== undefined && typeof settings.selectedDefault === 'string') {
+      selectedDefault = settings.selectedDefault
+    }
+  } catch {
+    // Optional settings service; a composition without it still lists modes.
+  }
+  const modes = roster
+    .map((preset, index) => {
+      const isBuiltIn = preset.name === undefined && builtInNames[preset.id] !== undefined
+      return {
+        id: preset.id,
+        name: isBuiltIn ? builtInNames[preset.id] : (preset.name ?? preset.id),
+        description: isBuiltIn
+          ? builtInDescriptions[preset.id] ?? null
+          : (preset.description ?? null),
+        builtIn: isBuiltIn,
+        broken: typeof preset.broken === 'string' ? preset.broken : null,
+        order: typeof preset.order === 'number' ? preset.order : index,
+      }
+    })
+    .sort((left, right) => left.order - right.order)
+  return { modes, selectedDefault }
+}
+
+/**
+ * Read the permission presets a Session may switch to, and its current one.
+ *
+ * Permission presets are a process-level catalog (they change with live
+ * contributions), while the Session's own choice is a durable projection. Both
+ * are needed: the catalog fills the menu, the projection marks the current row.
+ * @param ctx - the Host plugin context.
+ * @param session - the live Session, or undefined for a catalog-only read.
+ * @returns selectable options plus the current value, or null without a service.
+ */
+function permissionsPayload(ctx, session) {
+  const service = ctx.get('permissionPresets')
+  if (service === undefined) return null
+  let catalog
+  try {
+    catalog = service.catalog()
+  } catch (error) {
+    ctx.logger.warn(`dsh-mobile-bridge: permission catalog failed: ${error?.message ?? error}`)
+    return null
+  }
+  let currentValue = null
+  if (session !== undefined) {
+    try {
+      currentValue = service.current(session)
+    } catch (error) {
+      ctx.logger.warn(`dsh-mobile-bridge: permission current failed: ${error?.message ?? error}`)
+    }
+  }
+  return {
+    options: (catalog.options ?? []).map((option) => ({
+      value: option.value,
+      name: option.name,
+      description: typeof option.description === 'string' ? option.description : null,
+    })),
+    defaultPreset: typeof catalog.defaultPreset === 'string' ? catalog.defaultPreset : null,
+    currentValue,
+  }
+}
+
 /**
  * Read a bounded transcript page for one Session.
  * @param controller - the Host Session API.
@@ -908,8 +1050,7 @@ function summarize(row) {
  * @param signal - cancellation for the read.
  * @returns the folded nodes, the state, and the page cursor.
  */
-async function readSession(controller, sessionId, signal) {
-  const page = await controller.events({
+async function readSession(controller, sessionId, signal) {  const page = await controller.events({
     address: { kind: 'session', sessionId },
     maxMessages: MAX_HISTORY_MESSAGES,
   }, signal)
@@ -969,6 +1110,23 @@ async function handleRequest(ctx, settings, req, res) {
       sendJson(res, 200, await modelCatalogFor(ctx, controller))
       return
     }
+    if (segments[1] === 'workspaces' && segments.length === 2) {
+      sendJson(res, 200, await workspacesPayload(ctx))
+      return
+    }
+    if (segments[1] === 'modes' && segments.length === 2) {
+      sendJson(res, 200, await presetsPayload(ctx))
+      return
+    }
+    if (segments[1] === 'permissions' && segments.length === 2) {
+      const catalog = permissionsPayload(ctx, undefined)
+      if (catalog === null) {
+        sendJson(res, 404, { error: 'unsupported', message: 'This Harness composes no permission service.' })
+        return
+      }
+      sendJson(res, 200, catalog)
+      return
+    }
     if (segments[1] === 'sessions') {
       if (segments.length === 2 && req.method === 'GET') {
         const signal = new AbortController().signal
@@ -983,6 +1141,7 @@ async function handleRequest(ctx, settings, req, res) {
         const created = await controller.create({
           ...(typeof body.cwd === 'string' && body.cwd !== '' ? { cwd: body.cwd } : {}),
           ...(typeof body.agentPreset === 'string' && body.agentPreset !== '' ? { agentPreset: body.agentPreset } : {}),
+          ...(typeof body.workspaceId === 'string' && body.workspaceId !== '' ? { workspaceId: body.workspaceId } : {}),
         })
         sendJson(res, 200, created)
         return
@@ -1004,6 +1163,9 @@ async function handleRequest(ctx, settings, req, res) {
           state,
           // The model this Session will use for its next prompt.
           model: await currentSelection(ctx, sessionId),
+          // The permission preset in force for this Session, when the
+          // composition provides the service.
+          permissions: permissionsPayload(ctx, ctx.sessions.get(sessionId)),
           ...page,
         })
         return
@@ -1040,6 +1202,28 @@ async function handleRequest(ctx, settings, req, res) {
       }
       if (tail === 'cancel' && req.method === 'POST') {
         sendJson(res, 200, controller.cancel({ sessionId }))
+        return
+      }
+      if (tail === 'permission' && req.method === 'POST') {
+        const body = await readJsonBody(req)
+        if (typeof body.value !== 'string' || body.value === '') {
+          sendJson(res, 400, { error: 'bad-request', message: '`value` is required.' })
+          return
+        }
+        const service = ctx.get('permissionPresets')
+        if (service === undefined) {
+          sendJson(res, 404, { error: 'unsupported', message: 'This Harness composes no permission service.' })
+          return
+        }
+        const session = ctx.sessions.get(sessionId)
+        if (session === undefined) {
+          sendJson(res, 404, { error: 'session/not-found', message: `No live Session ${sessionId}.` })
+          return
+        }
+        // `set` applies the preset's sandbox and approval knobs to this Session
+        // only; it does not change the process default for future Sessions.
+        service.set(session, body.value)
+        sendJson(res, 200, permissionsPayload(ctx, session))
         return
       }
       if (tail === 'model' && req.method === 'POST') {

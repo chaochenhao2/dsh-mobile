@@ -37,6 +37,25 @@ struct ChatView: View {
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 HStack(spacing: 14) {
+                    if let permissions = chat.permissions, !permissions.options.isEmpty {
+                        Menu {
+                            ForEach(permissions.options) { option in
+                                Button {
+                                    Task { await chat.switchPermission(option.value) }
+                                } label: {
+                                    if option.value == permissions.currentValue {
+                                        Label(option.name, systemImage: "checkmark")
+                                    } else {
+                                        Text(option.name)
+                                    }
+                                }
+                            }
+                        } label: {
+                            Image(systemName: "lock.shield")
+                                .foregroundStyle(permissions.currentValue == nil ? Theme.textTertiary : Theme.accentAlt)
+                        }
+                        .disabled(chat.isSwitchingPermission)
+                    }
                     Button {
                         showsModelPicker = true
                     } label: {
@@ -299,6 +318,13 @@ struct ChatView: View {
                     }
                     .buttonStyle(.plain)
                 }
+                if let permission = chat.permissions?.current {
+                    Text("·").foregroundStyle(Theme.textTertiary)
+                    Text(permission.name)
+                        .font(.system(size: 11, design: .rounded))
+                        .foregroundStyle(permissionTint(permission.value))
+                        .lineLimit(1)
+                }
                 Spacer()
                 if !chat.pendingInput.isEmpty {
                     Text("需要你在电脑上确认")
@@ -348,6 +374,19 @@ struct ChatView: View {
             Rectangle()
                 .fill(Theme.border)
                 .frame(height: 1)
+        }
+    }
+
+    /// Colour a permission preset by how much it allows, so a dangerous
+    /// selection is visible at a glance rather than only by its name.
+    /// @param value - preset value from the catalog.
+    /// @returns the tint for that preset.
+    private func permissionTint(_ value: String) -> Color {
+        switch value {
+        case "read-only": return Theme.textSecondary
+        case "workspace-write": return Theme.accentAlt
+        case "danger-full-access", "auto": return Theme.warning
+        default: return Theme.textTertiary
         }
     }
 

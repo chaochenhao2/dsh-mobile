@@ -3,11 +3,14 @@ import SwiftUI
 /// Every Session on the connected Harness, newest first.
 struct SessionsView: View {
     @EnvironmentObject private var store: AppStore
-    @State private var isCreating = false
     @State private var showsSettings = false
+    @State private var showsNewSession = false
+    /// Drives programmatic navigation into a freshly created Session.
+    /// iOS 16 has no `navigationDestination(item:)`, so a path is pushed instead.
+    @State private var path: [String] = []
 
     var body: some View {
-        NavigationStack {
+        NavigationStack(path: $path) {
             ZStack {
                 Theme.background.ignoresSafeArea()
                 content
@@ -23,19 +26,29 @@ struct SessionsView: View {
                     }
                 }
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button(action: createSession) {
-                        if isCreating {
-                            ProgressView()
-                        } else {
-                            Image(systemName: "square.and.pencil")
-                        }
+                    Button {
+                        showsNewSession = true
+                    } label: {
+                        Image(systemName: "square.and.pencil")
                     }
-                    .disabled(isCreating)
                 }
             }
             .sheet(isPresented: $showsSettings) {
                 SettingsView()
                     .environmentObject(store)
+            }
+            .sheet(isPresented: $showsNewSession) {
+                NewSessionView { sessionID in
+                    openCreated(sessionID)
+                }
+                .environmentObject(store)
+            }
+            .navigationDestination(for: String.self) { sessionID in
+                ChatView(
+                    sessionID: sessionID,
+                    title: store.sessions.first { $0.id == sessionID }?.title ?? "会话",
+                    endpoint: store.endpoint
+                )
             }
             .task {
                 await store.refreshSessions()
@@ -44,6 +57,12 @@ struct SessionsView: View {
                 await store.refreshSessions()
             }
         }
+    }
+
+    /// Navigate into a freshly created Session.
+    /// @param sessionID - the identity the bridge returned.
+    private func openCreated(_ sessionID: String) {
+        path.append(sessionID)
     }
 
     @ViewBuilder
@@ -58,9 +77,7 @@ struct SessionsView: View {
                         ErrorBanner(message: error)
                     }
                     ForEach(store.sessions) { session in
-                        NavigationLink {
-                            ChatView(sessionID: session.id, title: session.title, endpoint: store.endpoint)
-                        } label: {
+                        NavigationLink(value: session.id) {
                             row(session)
                         }
                         .buttonStyle(.plain)
@@ -141,7 +158,7 @@ struct SessionsView: View {
             Text("点右上角新建一个，或先在电脑上开始对话。")
                 .font(.system(size: 13))
                 .foregroundStyle(Theme.textTertiary)
-            Button("新建会话", action: createSession)
+            Button("新建会话") { showsNewSession = true }
                 .buttonStyle(PrimaryButtonStyle())
                 .frame(maxWidth: 220)
                 .padding(.top, 8)
@@ -150,15 +167,6 @@ struct SessionsView: View {
     }
 
     // MARK: - Actions
-
-    private func createSession() {
-        guard !isCreating else { return }
-        isCreating = true
-        Task {
-            _ = await store.createSession()
-            isCreating = false
-        }
-    }
 
     private func shortPath(_ path: String) -> String {
         let components = path.split(separator: "/")

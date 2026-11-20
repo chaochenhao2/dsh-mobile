@@ -147,6 +147,51 @@ struct BridgeAPI {
         return result.sessionId
     }
 
+    /// Create a Session anchored to a workspace, a typed path, or neither.
+    /// @param workspaceID - existing workspace to attach, when chosen.
+    /// @param cwd - directory typed by hand, when no workspace is chosen.
+    /// @param agentPreset - agent mode id, or nil for the Harness default.
+    /// @returns the new Session identity.
+    func createSession(workspaceID: String?, cwd: String?, agentPreset: String?) async throws -> String {
+        var body: [String: Any] = [:]
+        if let workspaceID, !workspaceID.isEmpty { body["workspaceId"] = workspaceID }
+        if let cwd, !cwd.isEmpty { body["cwd"] = cwd }
+        if let agentPreset, !agentPreset.isEmpty { body["agentPreset"] = agentPreset }
+        let result: SessionCreateResult = try await send("POST", "/api/sessions", body: body, session: Self.session)
+        return result.sessionId
+    }
+
+    /// Read every durable workspace plus the process default directory.
+    func workspaces() async throws -> WorkspacesPayload {
+        try await send("GET", "/api/workspaces", body: nil, session: Self.session)
+    }
+
+    /// Read the selectable agent modes.
+    func modes() async throws -> ModesPayload {
+        try await send("GET", "/api/modes", body: nil, session: Self.session)
+    }
+
+    /// Read the process-level permission catalog.
+    func permissions() async throws -> PermissionsPayload {
+        try await send("GET", "/api/permissions", body: nil, session: Self.session)
+    }
+
+    /// Switch one Session's permission preset.
+    ///
+    /// This changes only this Session's sandbox and approval knobs; the default
+    /// for future Sessions is untouched.
+    /// @param sessionID - Session whose permission changes.
+    /// @param value - preset value from the catalog.
+    /// @returns the resulting state.
+    func setPermission(sessionID: String, value: String) async throws -> PermissionsPayload {
+        try await send(
+            "POST",
+            "/api/session/\(escaped(sessionID))/permission",
+            body: ["value": value],
+            session: Self.session
+        )
+    }
+
     func detail(sessionID: String) async throws -> SessionDetail {
         try await send("GET", "/api/session/\(escaped(sessionID))", body: nil, session: Self.session)
     }
