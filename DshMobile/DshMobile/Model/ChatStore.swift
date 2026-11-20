@@ -95,10 +95,17 @@ final class ChatStore: ObservableObject {
 
     // MARK: - Lifecycle
 
-    /// Read the transcript, then follow it live.
+    /// Open the stream first, then read the one-shot detail alongside it.
+    ///
+    /// Order matters. The stream's opening snapshot already carries the whole
+    /// transcript, so waiting for the detail request first would leave the
+    /// screen blank for as long as that request takes — and if it fails, for the
+    /// length of its whole retry budget. Starting the stream first means the
+    /// conversation appears as soon as the network allows, and the detail read
+    /// only adds the metadata the snapshot does not carry (title, permission).
     func start() async {
-        await load()
         follow()
+        await load()
     }
 
     /// Stop following. The Session keeps running on the computer.
@@ -108,11 +115,17 @@ final class ChatStore: ObservableObject {
     }
 
     /// Read the whole Session once.
+    ///
+    /// The stream is the source of truth for the transcript, so this read only
+    /// fills the metadata the snapshot does not carry. When it fails after the
+    /// stream has already delivered nodes, the conversation stays on screen and
+    /// the failure is only recorded — replacing a working transcript with an
+    /// error because a secondary request lost a race would be wrong.
     func load() async {
         isLoading = nodes.isEmpty
         do {
             let detail = try await api.detail(sessionID: sessionID)
-            nodes = detail.nodes
+            if nodes.isEmpty { nodes = detail.nodes }
             isRunning = detail.state.running
             pendingInput = detail.state.pendingInput
             model = detail.model
@@ -121,10 +134,23 @@ final class ChatStore: ObservableObject {
             lastError = nil
             clearRetryState()
         } catch {
-            lastError = Self.describe(error)
+            if nodes.isEmpty {
+                lastError = Self.describe(error)
+            } else {
+                // Nodes are already shown: a metadata miss must not blank them.
+                Self.logQuietly(error)
+            }
         }
         isLoading = false
         tick += 1
+    }
+
+    /// Record a failure that must not change what is on screen.
+    /// @param error - the failure to note.
+    private static func logQuietly(_ error: Error) {
+        #if DEBUG
+        print("ChatStore: non-fatal read failure: \(describe(error))")
+        #endif
     }
 
     // MARK: - Model
@@ -263,6 +289,10 @@ final class ChatStore: ObservableObject {
             pendingInput = frame.pendingInput ?? []
             startedAt = isRunning ? Date() : nil
             lastError = nil
+            // A snapshot proves the transport recovered. Without this the banner
+            // keeps whatever count the last failed attempt left behind, so a
+            // healthy conversation still reads "reconnecting 3/3".
+            clearRetryState()
         case "op":
             applyOperator(frame)
             return

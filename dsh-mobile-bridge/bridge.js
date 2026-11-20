@@ -18,8 +18,8 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 /** Loader id for the single row this bundle inserts. */
 export const name = 'dsh-mobile-bridge'
 
-/** The Host Session API is the only hard dependency; everything else is optional. */
-export const inject = ['sessionController']
+/** The Host Session API is the only hard dependency; other services are optional. */
+export const inject = ['sessionController', 'sessions']
 
 /** Bumped when the wire protocol with the iOS app changes incompatibly. */
 const BRIDGE_VERSION = '1.0.0'
@@ -1005,6 +1005,54 @@ async function presetsPayload(ctx) {
 }
 
 /**
+ * Look up one live Session without throwing for a cold one.
+ *
+ * Reads that are optional for the response — permissions, for instance — must
+ * degrade to "unknown" rather than failing the whole endpoint, because a
+ * Session on disk has not been activated until something opens it.
+ * @param ctx - the Host plugin context.
+ * @param sessionId - the Session to look up.
+ * @returns the live Session, or undefined when it is cold.
+ */
+function liveSession(ctx, sessionId) {
+  try {
+    return ctx.sessions.get(sessionId)
+  } catch (error) {
+    ctx.logger.warn(`dsh-mobile-bridge: live Session lookup failed for ${sessionId}: ${error?.message ?? error}`)
+    return undefined
+  }
+}
+
+/**
+ * Resolve a Session, activating it when it is currently cold.
+ *
+ * A freshly created Session, or one opened after a restart, may not be in the
+ * in-memory store until something activates it. Activation goes through the
+ * Session API, and the resolved Agent's own Session object is used directly:
+ * the registry lookup can still miss it when activation registered the Agent
+ * through another path.
+ * @param ctx - the Host plugin context.
+ * @param sessionId - the Session to resolve.
+ * @returns the live Session, or undefined when it cannot be activated.
+ */
+async function ensureSession(ctx, sessionId) {
+  const existing = liveSession(ctx, sessionId)
+  if (existing !== undefined) return existing
+  const controller = ctx.get('sessionController')
+  if (controller === undefined) return undefined
+  try {
+    const result = await controller.resolveAgent(sessionId)
+    // The resolved Agent owns the Session object; the registry lookup may still
+    // miss it when activation registered the Agent through another path.
+    const session = result?.agent?.session
+    if (session !== undefined) return session
+  } catch (error) {
+    ctx.logger.warn(`dsh-mobile-bridge: Session ${sessionId} could not be activated: ${error?.message ?? error}`)
+  }
+  return liveSession(ctx, sessionId)
+}
+
+/**
  * Read the permission presets a Session may switch to, and its current one.
  *
  * Permission presets are a process-level catalog (they change with live
@@ -1163,9 +1211,11 @@ async function handleRequest(ctx, settings, req, res) {
           state,
           // The model this Session will use for its next prompt.
           model: await currentSelection(ctx, sessionId),
-          // The permission preset in force for this Session, when the
-          // composition provides the service.
-          permissions: permissionsPayload(ctx, ctx.sessions.get(sessionId)),
+          // The permission preset in force for this Session. A Cold Session has
+          // no live object yet, so activation is attempted; when it still fails
+          // the catalog is returned without a current value rather than failing
+          // the whole read.
+          permissions: permissionsPayload(ctx, await ensureSession(ctx, sessionId)),
           ...page,
         })
         return
@@ -1215,14 +1265,25 @@ async function handleRequest(ctx, settings, req, res) {
           sendJson(res, 404, { error: 'unsupported', message: 'This Harness composes no permission service.' })
           return
         }
-        const session = ctx.sessions.get(sessionId)
+        // A Session can be cold — freshly created, or opened after a restart —
+        // and `permissionPresets.set` needs the live object. Resolve it through
+        // the Session API, which activates on demand, instead of failing.
+        const session = await ensureSession(ctx, sessionId)
         if (session === undefined) {
-          sendJson(res, 404, { error: 'session/not-found', message: `No live Session ${sessionId}.` })
+          sendJson(res, 404, { error: 'session/not-found', message: `No Session ${sessionId}.` })
           return
         }
-        // `set` applies the preset's sandbox and approval knobs to this Session
-        // only; it does not change the process default for future Sessions.
-        service.set(session, body.value)
+        try {
+          // `set` applies the preset's sandbox and approval knobs to this
+          // Session only; it does not change the default for future Sessions.
+          service.set(session, body.value)
+        } catch (error) {
+          sendJson(res, 400, {
+            error: 'permission/unknown-preset',
+            message: error instanceof Error ? error.message : String(error),
+          })
+          return
+        }
         sendJson(res, 200, permissionsPayload(ctx, session))
         return
       }
