@@ -54,7 +54,7 @@ struct DownloadedFile: Identifiable, Equatable {
     let url: URL
     let bytes: Int
     /// When it was written, for ordering.
-    var modified: Date?
+    var modified: Date? = nil
 
     /// A compact size label.
     var sizeText: String {

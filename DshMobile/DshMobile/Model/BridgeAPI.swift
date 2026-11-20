@@ -288,14 +288,16 @@ struct BridgeAPI {
         return try await send("GET", requestPath, body: nil, session: Self.session)
     }
 
-    /// Download the selected paths as one ZIP archive.
+    /// Download the selected paths.
     ///
-    /// Folders are expanded on the computer, so the phone receives a single
-    /// streamed body and writes one file rather than walking the tree itself.
+    /// The bridge sends a single file as itself and several as a ZIP, so what
+    /// comes back may be any size. `download(for:)` writes the body to a
+    /// temporary file instead of a `Data` buffer, which is what keeps a
+    /// multi-gigabyte download from exhausting the phone's memory.
     /// @param sessionID - Session whose files are read.
     /// @param paths - absolute paths chosen on the phone.
-    /// @returns the archive bytes and the suggested file name.
-    func downloadArchive(sessionID: String, paths: [String]) async throws -> (data: Data, fileName: String) {
+    /// @returns the temporary file URL and the suggested file name.
+    func download(sessionID: String, paths: [String]) async throws -> (temporaryURL: URL, fileName: String) {
         let body = try JSONSerialization.data(withJSONObject: ["paths": paths])
         let request = try makeRequest(
             "POST",
@@ -304,15 +306,18 @@ struct BridgeAPI {
         )
         return try await Retry.run(maxAttempts: RetryPolicy.maxAttempts) {
             do {
-                let (data, response) = try await Self.downloadSession.data(for: request)
+                let (url, response) = try await Self.downloadSession.download(for: request)
                 guard let http = response as? HTTPURLResponse else {
                     throw BridgeError.transport("没有收到 HTTP 响应")
                 }
                 guard (200..<300).contains(http.statusCode) else {
+                    // An error body is small, so reading it here is safe.
+                    let data = (try? Data(contentsOf: url)) ?? Data()
                     let text = String(data: data, encoding: .utf8) ?? ""
+                    try? FileManager.default.removeItem(at: url)
                     throw BridgeError.http(status: http.statusCode, body: text)
                 }
-                return (data, Self.archiveName(from: http))
+                return (url, Self.suggestedName(from: http))
             } catch let error as BridgeError {
                 throw error
             } catch {
@@ -322,19 +327,19 @@ struct BridgeAPI {
         }
     }
 
-    /// Read the suggested archive name from the response headers.
+    /// Read the suggested file name from the response headers.
     ///
     /// The bridge sends an RFC 5987 `filename*` with percent-encoding, which is
     /// what keeps a non-ASCII name intact across the wire.
     /// @param response - the HTTP response.
     /// @returns the decoded name, falling back to a generic one.
-    private static func archiveName(from response: HTTPURLResponse) -> String {
+    private static func suggestedName(from response: HTTPURLResponse) -> String {
         let raw = response.value(forHTTPHeaderField: "content-disposition") ?? ""
         if let range = raw.range(of: "filename*=UTF-8''") {
             let encoded = String(raw[range.upperBound...]).trimmingCharacters(in: .whitespaces)
             if let decoded = encoded.removingPercentEncoding, !decoded.isEmpty { return decoded }
         }
-        return "dsh-files.zip"
+        return "dsh-file"
     }
 
     /// Follow one Session, yielding every operator the bridge emits.

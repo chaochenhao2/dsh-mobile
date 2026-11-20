@@ -18,20 +18,36 @@ enum FileDelivery {
         return base
     }
 
-    /// Write bytes into Documents under a collision-free name.
-    /// @param data - the file contents.
+    /// Move a downloaded temporary file into Documents under a collision-free name.
+    ///
+    /// Moving rather than copying keeps a large download from occupying the
+    /// container twice while it is being imported.
+    /// @param temporaryURL - the file URLSession wrote.
     /// @param name - the suggested file name.
-    /// @returns the stored file, or nil when writing failed.
-    static func store(data: Data, name: String) -> DownloadedFile? {
+    /// @returns the stored file, or nil when the move failed.
+    static func store(fileAt temporaryURL: URL, name: String) -> DownloadedFile? {
         let directory = documentsDirectory
         let safeName = sanitize(name)
         let destination = directory.appendingPathComponent(uniqueName(for: safeName))
         do {
-            try data.write(to: destination, options: .atomic)
+            try FileManager.default.moveItem(at: temporaryURL, to: destination)
         } catch {
-            return nil
+            // A move across volumes fails; fall back to a copy and clean up.
+            do {
+                try FileManager.default.copyItem(at: temporaryURL, to: destination)
+                try? FileManager.default.removeItem(at: temporaryURL)
+            } catch {
+                try? FileManager.default.removeItem(at: temporaryURL)
+                return nil
+            }
         }
-        return DownloadedFile(name: destination.lastPathComponent, url: destination, bytes: data.count)
+        let bytes = (try? destination.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        return DownloadedFile(
+            name: destination.lastPathComponent,
+            url: destination,
+            bytes: bytes,
+            modified: Date()
+        )
     }
 
     /// Every file currently held in Documents, newest first.

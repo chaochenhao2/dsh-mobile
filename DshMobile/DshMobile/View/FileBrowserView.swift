@@ -296,12 +296,15 @@ struct FileBrowserView: View {
         Task {
             defer { isDownloading = false }
             do {
-                let result = try await api.downloadArchive(
+                let result = try await api.download(
                     sessionID: sessionID,
                     paths: Array(selection)
                 )
-                guard let file = FileDelivery.store(data: result.data, name: result.fileName) else {
-                    downloadNote = "无法写入文件。"
+                guard let file = FileDelivery.store(
+                    fileAt: result.temporaryURL,
+                    name: result.fileName
+                ) else {
+                    downloadNote = "无法保存文件。"
                     return
                 }
                 downloadNote = "已保存 \(file.name)（\(file.sizeText)）"

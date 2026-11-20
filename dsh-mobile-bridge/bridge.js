@@ -11,9 +11,9 @@
 import { createServer } from 'node:http'
 import { createSocket } from 'node:dgram'
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
-import { hostname, networkInterfaces, platform, release, homedir } from 'node:os'
-import { dirname, join } from 'node:path'
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { hostname, networkInterfaces, platform, release, homedir, tmpdir } from 'node:os'
+import { dirname, join, basename } from 'node:path'
+import { mkdirSync, readFileSync, writeFileSync, createWriteStream, createReadStream, unlinkSync } from 'node:fs'
 
 /** Loader id for the single row this bundle inserts. */
 export const name = 'dsh-mobile-bridge'
@@ -36,10 +36,6 @@ const KEEPALIVE_MS = 15_000
 const STATE_POLL_MS = 2_000
 const BEACON_INTERVAL_MS = 3_000
 const TOOL_RESULT_CHARS = 4_000
-/** Upper bound on one archive response, so a phone is never sent a huge body. */
-const MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
-/** Upper bound on entries, so a folder with millions of files cannot stall. */
-const MAX_ARCHIVE_ENTRIES = 5_000
 /** Recursion bound for directory selection; guards against symlink loops. */
 const MAX_ARCHIVE_DEPTH = 32
 
@@ -867,34 +863,282 @@ async function sendArchive(ctx, controller, res, sessionId, selection) {
     sendJson(res, 404, { error: 'unsupported', message: 'This Harness exposes no workspace files.' })
     return
   }
-  const { entries, skipped } = await collectSelection(ctx, service, scope, selection, signal)
-  if (entries.length === 0) {
-    sendJson(res, 422, {
+
+  // One file is sent as itself, never wrapped in a ZIP: the person asked for
+  // that file, and an archive would both rename it and buffer it in memory.
+  if (selection.length === 1) {
+    const direct = await sendSingleFile(ctx, service, scope, res, selection[0], signal)
+    if (direct) return
+    // Not a regular file after all (a folder, or a vanished path): fall through
+    // to the archive path so the selection still produces something.
+  }
+
+  const collected = await collectToDisk(ctx, service, scope, selection, signal)
+  if (collected.entries === 0) {
+    sendJson(res, collected.skipped.length > 0 ? 422 : 404, {
       error: 'archive/empty',
-      message: 'Nothing could be read from the selection.',
-      skipped: skipped.slice(0, 20),
+      message: '选中的内容无法读取。',
+      skipped: collected.skipped.slice(0, 20),
     })
     return
   }
-  const archive = buildZip(entries)
-  // Name the archive after the single chosen item, or after the folder when the
-  // selection is a mix; a multi-item archive named after one of its members
-  // would mislead the person about what they downloaded.
+  // Name the archive after the single chosen folder, or after the workspace when
+  // several items went in; naming a bundle after one of its members would
+  // mislead the person about what they downloaded.
   const singleTop = selection.length === 1 ? baseName(selection[0]) : null
-  const rawName = singleTop !== null && entries.length === 1
-    ? singleTop
-    : `${baseName(scope.workspaceRoot)}-${entries.length}项`
-  const fileName = rawName.toLowerCase().endsWith('.zip') ? rawName : `${rawName}.zip`
+  const stem = singleTop ?? baseName(scope.workspaceRoot)
+  const fileName = `${stem}-${collected.entries}项.zip`
+  const incomplete = collected.skipped.length
   res.writeHead(200, {
     'content-type': 'application/zip',
-    'content-length': String(archive.length),
+    'content-length': String(collected.bytes),
     'content-disposition': `attachment; filename*=UTF-8''${encodeURIComponent(fileName)}`,
     'cache-control': 'no-store',
-    ...(skipped.length === 0 ? {} : { 'x-skipped-entries': String(skipped.length) }),
+    ...(incomplete === 0 ? {} : { 'x-skipped-entries': String(incomplete) }),
     ...corsHeaders(),
     'access-control-expose-headers': 'x-skipped-entries, content-disposition',
   })
-  res.end(archive)
+  // The archive lives in a temporary file, so it reaches the phone by stream
+  // rather than as one buffer: a large folder never has to fit in memory.
+  const stream = createReadStream(collected.path)
+  stream.on('error', () => {
+    res.destroy()
+  })
+  res.on('close', () => {
+    stream.destroy()
+    collected.cleanup()
+  })
+  stream.pipe(res)
+}
+
+/**
+ * Send one regular file as itself.
+ *
+ * The bytes are streamed straight from disk: no ZIP wrapper, no size limit, and
+ * nothing loaded into the host process.
+ * @param ctx - the Host plugin context.
+ * @param service - the workspace files service.
+ * @param scope - the Session's file scope.
+ * @param res - the response being written.
+ * @param absolute - the file to send.
+ * @param signal - cancellation for the stat.
+ * @returns whether the file was sent; false when it is not a regular file.
+ */
+async function sendSingleFile(ctx, service, scope, res, absolute, signal) {
+  let stat
+  try {
+    stat = await service.stat(scope, absolute, signal)
+  } catch (error) {
+    ctx.logger.warn(`dsh-mobile-bridge: stat failed for ${absolute}: ${error?.message ?? error}`)
+    return false
+  }
+  // A directory reports no byte count through this service; anything else is a
+  // regular file as far as the phone is concerned.
+  if (typeof stat.bytes !== 'number') return false
+  const name = basename(absolute)
+  res.writeHead(200, {
+    'content-type': contentTypeFor(name),
+    'content-length': String(stat.bytes),
+    'content-disposition': `attachment; filename*=UTF-8''${encodeURIComponent(name)}`,
+    'cache-control': 'no-store',
+    ...corsHeaders(),
+    'access-control-expose-headers': 'content-disposition',
+  })
+  const stream = createReadStream(absolute)
+  stream.on('error', (error) => {
+    ctx.logger.warn(`dsh-mobile-bridge: stream failed for ${absolute}: ${error?.message ?? error}`)
+    res.destroy()
+  })
+  res.on('close', () => stream.destroy())
+  stream.pipe(res)
+  return true
+}
+
+/**
+ * Build a ZIP of the selection in a temporary file.
+ *
+ * Entries are appended one at a time and each member's local header is written
+ * before its bytes, so only one file is in memory at any moment. The central
+ * directory is collected as small descriptors and appended last, which keeps the
+ * whole archive out of the process even for a multi-gigabyte folder.
+ * @param ctx - the Host plugin context.
+ * @param service - the workspace files service.
+ * @param scope - the Session's file scope.
+ * @param selection - absolute paths chosen on the phone.
+ * @param signal - cancellation for the reads.
+ * @returns the temporary archive path, its byte size, the entry count and a cleanup.
+ */
+async function collectToDisk(ctx, service, scope, selection, signal) {
+  const directory = join(tmpdir(), 'dsh-mobile-bridge')
+  try {
+    mkdirSync(directory, { recursive: true })
+  } catch (error) {
+    ctx.logger.warn(`dsh-mobile-bridge: could not create temp directory: ${error?.message ?? error}`)
+  }
+  const archivePath = join(directory, `archive-${randomUUID()}.zip`)
+  const output = createWriteStream(archivePath)
+  const descriptors = []
+  const skipped = []
+  const seenDirectories = new Set()
+  let offset = 0
+  let entryCount = 0
+  const now = new Date()
+  const dosTime = ((now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1)) & 0xffff
+  const dosDate = (((now.getFullYear() - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate()) & 0xffff
+
+  /**
+   * Append bytes and advance the running offset.
+   * @param buffer - the bytes to write.
+   */
+  const write = (buffer) => new Promise((resolve) => {
+    offset += buffer.length
+    if (output.write(buffer)) resolve()
+    else output.once('drain', resolve)
+  })
+
+  /**
+   * Add one path, descending into directories.
+   * @param absolute - absolute path to include.
+   * @param name - name recorded inside the archive.
+   * @param depth - recursion depth, bounded to stop link loops.
+   */
+  const add = async (absolute, name, depth) => {
+    if (signal.aborted) return
+    let listing = null
+    try {
+      listing = await service.list(scope, absolute, signal)
+    } catch {
+      // Not a directory: fall through to the file read.
+    }
+    if (listing !== null) {
+      if (seenDirectories.has(absolute) || depth > MAX_ARCHIVE_DEPTH) return
+      seenDirectories.add(absolute)
+      for (const child of listing.entries ?? []) {
+        await add(
+          joinPath(absolutize(scope.workspaceRoot, absolute, listing.path), child.name),
+          `${name}/${child.name}`,
+          depth + 1,
+        )
+      }
+      return
+    }
+    try {
+      const file = await service.readBytes(scope, absolute, {}, signal)
+      const data = Buffer.from(file.data)
+      const nameBytes = Buffer.from(name, 'utf8')
+      const checksum = crc32(data)
+      const localOffset = offset
+      const local = Buffer.alloc(30)
+      local.writeUInt32LE(0x04034b50, 0)
+      local.writeUInt16LE(20, 4)
+      local.writeUInt16LE(0x0800, 6)
+      local.writeUInt16LE(0, 8)
+      local.writeUInt16LE(dosTime, 10)
+      local.writeUInt16LE(dosDate, 12)
+      local.writeUInt32LE(checksum, 14)
+      local.writeUInt32LE(data.length, 18)
+      local.writeUInt32LE(data.length, 22)
+      local.writeUInt16LE(nameBytes.length, 26)
+      local.writeUInt16LE(0, 28)
+      await write(local)
+      await write(nameBytes)
+      await write(data)
+      descriptors.push({ name: nameBytes, checksum, bytes: data.length, offset: localOffset })
+      entryCount += 1
+    } catch (error) {
+      skipped.push(`${absolute}: ${error?.message ?? error}`)
+    }
+  }
+
+  for (const selected of selection) {
+    await add(selected, basename(selected), 0)
+  }
+
+  // Central directory, written after every member so the offsets are final.
+  const centralStart = offset
+  for (const descriptor of descriptors) {
+    const central = Buffer.alloc(46)
+    central.writeUInt32LE(0x02014b50, 0)
+    central.writeUInt16LE(20, 4)
+    central.writeUInt16LE(20, 6)
+    central.writeUInt16LE(0x0800, 8)
+    central.writeUInt16LE(0, 10)
+    central.writeUInt16LE(dosTime, 12)
+    central.writeUInt16LE(dosDate, 14)
+    central.writeUInt32LE(descriptor.checksum, 16)
+    central.writeUInt32LE(descriptor.bytes, 20)
+    central.writeUInt32LE(descriptor.bytes, 24)
+    central.writeUInt16LE(descriptor.name.length, 28)
+    central.writeUInt16LE(0, 30)
+    central.writeUInt16LE(0, 32)
+    central.writeUInt16LE(0, 34)
+    central.writeUInt16LE(0, 36)
+    central.writeUInt32LE(0, 38)
+    central.writeUInt32LE(descriptor.offset, 42)
+    await write(central)
+    await write(descriptor.name)
+  }
+  const centralSize = offset - centralStart
+  const end = Buffer.alloc(22)
+  end.writeUInt32LE(0x06054b50, 0)
+  end.writeUInt16LE(0, 4)
+  end.writeUInt16LE(0, 6)
+  end.writeUInt16LE(entryCount, 8)
+  end.writeUInt16LE(entryCount, 10)
+  end.writeUInt32LE(centralSize, 12)
+  end.writeUInt32LE(centralStart, 16)
+  end.writeUInt16LE(0, 20)
+  await write(end)
+
+  await new Promise((resolve) => output.end(resolve))
+  return {
+    path: archivePath,
+    bytes: offset,
+    entries: entryCount,
+    skipped,
+    cleanup: () => {
+      try {
+        unlinkSync(archivePath)
+      } catch {
+        // The file is already gone; nothing remains to reclaim.
+      }
+    },
+  }
+}
+
+/**
+ * Guess a content type from a file name.
+ *
+ * Sent so the phone writes the extension it expects; an unknown type falls back
+ * to binary, which every client handles.
+ * @param name - the file name.
+ * @returns an HTTP content type.
+ */
+function contentTypeFor(name) {
+  const extension = name.toLowerCase().split('.').pop() ?? ''
+  const known = {
+    txt: 'text/plain; charset=utf-8',
+    md: 'text/markdown; charset=utf-8',
+    json: 'application/json',
+    xml: 'application/xml',
+    yml: 'text/yaml; charset=utf-8',
+    yaml: 'text/yaml; charset=utf-8',
+    csv: 'text/csv; charset=utf-8',
+    html: 'text/html; charset=utf-8',
+    css: 'text/css; charset=utf-8',
+    js: 'text/javascript; charset=utf-8',
+    ts: 'text/plain; charset=utf-8',
+    png: 'image/png',
+    jpg: 'image/jpeg',
+    jpeg: 'image/jpeg',
+    gif: 'image/gif',
+    webp: 'image/webp',
+    svg: 'image/svg+xml',
+    pdf: 'application/pdf',
+    zip: 'application/zip',
+    ico: 'image/x-icon',
+  }
+  return known[extension] ?? 'application/octet-stream'
 }
 
 /**
@@ -1024,145 +1268,6 @@ function crc32(buffer) {
   return (crc ^ 0xffffffff) >>> 0
 }
 
-/**
- * Pack entries into a store-only ZIP archive.
- *
- * Storing rather than deflating keeps this dependency-free and predictable;
- * text files lose some size, but the transfer is a LAN hop and the alternative
- * is bundling a compressor into a plugin that has no dependencies at all.
- * @param entries - ordered `{ name, data }` pairs; names use forward slashes.
- * @param now - timestamp applied to every entry.
- * @returns the archive bytes.
- */
-function buildZip(entries, now = new Date()) {
-  const localParts = []
-  const centralParts = []
-  let offset = 0
-  const dosTime = ((now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1)) & 0xffff
-  const dosDate = (((now.getFullYear() - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate()) & 0xffff
-
-  for (const entry of entries) {
-    const nameBytes = Buffer.from(entry.name, 'utf8')
-    const data = entry.data
-    const checksum = crc32(data)
-
-    const local = Buffer.alloc(30)
-    local.writeUInt32LE(0x04034b50, 0)
-    local.writeUInt16LE(20, 4)
-    // Bit 11 marks the name as UTF-8 so non-ASCII paths survive unzip.
-    local.writeUInt16LE(0x0800, 6)
-    local.writeUInt16LE(0, 8)
-    local.writeUInt16LE(dosTime, 10)
-    local.writeUInt16LE(dosDate, 12)
-    local.writeUInt32LE(checksum, 14)
-    local.writeUInt32LE(data.length, 18)
-    local.writeUInt32LE(data.length, 22)
-    local.writeUInt16LE(nameBytes.length, 26)
-    local.writeUInt16LE(0, 28)
-    localParts.push(local, nameBytes, data)
-
-    const central = Buffer.alloc(46)
-    central.writeUInt32LE(0x02014b50, 0)
-    central.writeUInt16LE(20, 4)
-    central.writeUInt16LE(20, 6)
-    central.writeUInt16LE(0x0800, 8)
-    central.writeUInt16LE(0, 10)
-    central.writeUInt16LE(dosTime, 12)
-    central.writeUInt16LE(dosDate, 14)
-    central.writeUInt32LE(checksum, 16)
-    central.writeUInt32LE(data.length, 20)
-    central.writeUInt32LE(data.length, 24)
-    central.writeUInt16LE(nameBytes.length, 28)
-    central.writeUInt16LE(0, 30)
-    central.writeUInt16LE(0, 32)
-    central.writeUInt16LE(0, 34)
-    central.writeUInt16LE(0, 36)
-    central.writeUInt32LE(0, 38)
-    central.writeUInt32LE(offset, 42)
-    centralParts.push(central, nameBytes)
-
-    offset += local.length + nameBytes.length + data.length
-  }
-
-  const centralSize = centralParts.reduce((total, part) => total + part.length, 0)
-  const end = Buffer.alloc(22)
-  end.writeUInt32LE(0x06054b50, 0)
-  end.writeUInt16LE(0, 4)
-  end.writeUInt16LE(0, 6)
-  end.writeUInt16LE(entries.length, 8)
-  end.writeUInt16LE(entries.length, 10)
-  end.writeUInt32LE(centralSize, 12)
-  end.writeUInt32LE(offset, 16)
-  end.writeUInt16LE(0, 20)
-
-  return Buffer.concat([...localParts, ...centralParts, end])
-}
-
-/**
- * Collect every file under one selection, recursing into directories.
- *
- * Entry names are relative to the selection so the archive unzips into a tidy
- * folder rather than replaying the absolute path from the computer.
- * @param ctx - the Host plugin context.
- * @param service - the workspace files service.
- * @param scope - the Session's file scope.
- * @param selection - absolute paths chosen on the phone.
- * @param signal - cancellation for the reads.
- * @returns collected entries and the paths that could not be read.
- */
-async function collectSelection(ctx, service, scope, selection, signal) {
-  const entries = []
-  const skipped = []
-  let total = 0
-  const seenDirectories = new Set()
-
-  /**
-   * Add one path, descending into directories.
-   * @param absolute - absolute path to include.
-   * @param prefix - archive name prefix, empty for a top-level selection.
-   * @param depth - recursion depth, bounded to stop link loops.
-   */
-  const add = async (absolute, prefix, depth) => {
-    if (signal.aborted) return
-    if (total > MAX_ARCHIVE_BYTES || entries.length > MAX_ARCHIVE_ENTRIES) return
-    const name = prefix === '' ? baseName(absolute) : prefix
-    // `stat` reports a byte count for regular files only. Treating a missing
-    // size as "directory" keeps a zero-byte file readable and still descends,
-    // because the listing below decides which one this really is.
-    let listing = null
-    try {
-      listing = await service.list(scope, absolute, signal)
-    } catch {
-      // Not a directory: fall through to the file read.
-    }
-    if (listing !== null) {
-      if (seenDirectories.has(absolute) || depth > MAX_ARCHIVE_DEPTH) return
-      seenDirectories.add(absolute)
-      for (const child of listing.entries ?? []) {
-        await add(joinPath(absolutize(scope.workspaceRoot, absolute, listing.path), child.name), `${name}/${child.name}`, depth + 1)
-      }
-      return
-    }
-    try {
-      const file = await service.readBytes(scope, absolute, {}, signal)
-      const data = Buffer.from(file.data)
-      total += data.length
-      if (total > MAX_ARCHIVE_BYTES) {
-        skipped.push(`${absolute}: archive exceeds ${MAX_ARCHIVE_BYTES} bytes`)
-        return
-      }
-      entries.push({ name, data })
-    } catch (error) {
-      skipped.push(`${absolute}: ${error?.message ?? error}`)
-    }
-  }
-
-  for (const selected of selection) {
-    await add(selected, '', 0)
-    if (total > MAX_ARCHIVE_BYTES || entries.length > MAX_ARCHIVE_ENTRIES) break
-  }
-  return { entries, skipped, total }
-}
 
 /**
  * Take the last path segment, treating both separators as separators.
