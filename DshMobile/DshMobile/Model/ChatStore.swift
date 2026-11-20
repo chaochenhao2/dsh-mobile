@@ -135,6 +135,7 @@ final class ChatStore: ObservableObject {
             clearRetryState()
         } catch {
             if nodes.isEmpty {
+                if RetryPolicy.isCancellation(error) { return }
                 lastError = Self.describe(error)
             } else {
                 // Nodes are already shown: a metadata miss must not blank them.
@@ -164,6 +165,7 @@ final class ChatStore: ObservableObject {
             catalog = try await api.models()
             clearRetryState()
         } catch {
+            if RetryPolicy.isCancellation(error) { return }
             lastError = Self.describe(error)
         }
     }
@@ -185,6 +187,7 @@ final class ChatStore: ObservableObject {
             clearRetryState()
             return true
         } catch {
+            if RetryPolicy.isCancellation(error) { return false }
             lastError = Self.describe(error)
             return false
         }
@@ -216,6 +219,7 @@ final class ChatStore: ObservableObject {
             clearRetryState()
             return true
         } catch {
+            if RetryPolicy.isCancellation(error) { return false }
             lastError = Self.describe(error)
             return false
         }
@@ -251,6 +255,9 @@ final class ChatStore: ObservableObject {
                     break
                 } catch {
                     if Task.isCancelled { break }
+                    // A withdrawn request is news about the person's gesture, not
+                    // about the network: leave the status line alone.
+                    if RetryPolicy.isCancellation(error) { break }
                     guard RetryPolicy.isTransient(error) else {
                         self.lastError = Self.describe(error)
                         break
@@ -367,6 +374,7 @@ final class ChatStore: ObservableObject {
             return true
         } catch {
             isRetrying = false
+            if RetryPolicy.isCancellation(error) { return false }
             lastError = Self.describe(error)
             return false
         }
@@ -379,6 +387,7 @@ final class ChatStore: ObservableObject {
             isRunning = false
             startedAt = nil
         } catch {
+            if RetryPolicy.isCancellation(error) { return }
             lastError = Self.describe(error)
         }
     }

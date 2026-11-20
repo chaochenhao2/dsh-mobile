@@ -13,6 +13,10 @@ enum RetryPolicy {
     /// @param error - the failure to classify.
     /// @returns true for transport failures and transient HTTP statuses.
     static func isTransient(_ error: Error) -> Bool {
+        // Cancellation is never transient: the caller withdrew the request, so
+        // repeating it would work against them. `.refreshable` cancels a pull
+        // when the person pulls again, which arrives here as URLError.cancelled.
+        if isCancellation(error) { return false }
         guard let bridge = error as? BridgeError else {
             // URLSession surfaces connectivity loss as its own error type.
             return isTransientURLSessionError(error)
@@ -30,6 +34,27 @@ enum RetryPolicy {
         case .missingEndpoint, .invalidURL:
             return false
         }
+    }
+
+    /// Whether a failure means the caller stopped waiting.
+    ///
+    /// Both the Swift concurrency cancellation and the URL loading system's own
+    /// `cancelled` code mean the same thing here, and neither deserves a retry
+    /// or a message on screen.
+    /// @param error - the failure to classify.
+    /// @returns true when the request was withdrawn.
+    static func isCancellation(_ error: Error) -> Bool {
+        if error is CancellationError { return true }
+        if let bridge = error as? BridgeError {
+            if case .transport(let message) = bridge {
+                return message.contains("cancelled") || message.contains("canceled")
+            }
+            return false
+        }
+        if let urlError = error as? URLError {
+            return urlError.code == .cancelled
+        }
+        return false
     }
 
     /// Whether a raw `URLSession` error is a connectivity failure.

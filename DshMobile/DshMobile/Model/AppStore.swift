@@ -90,6 +90,7 @@ final class AppStore: ObservableObject {
             persist()
             return
         } catch {
+            if RetryPolicy.isCancellation(error) { return }
             lastError = Self.describe(error)
         }
         // The first address failed; walk the alternatives the bridge reported.
@@ -107,6 +108,7 @@ final class AppStore: ObservableObject {
                     persist()
                     return
                 } catch {
+                    if RetryPolicy.isCancellation(error) { return }
                     lastError = Self.describe(error)
                 }
             }
@@ -146,6 +148,11 @@ final class AppStore: ObservableObject {
     }
 
     /// Re-read the Session list without dropping the connection.
+    ///
+    /// A pull-to-refresh cancels the previous pull when the person pulls again,
+    /// and a screen that scrolled away cancels its in-flight read. Both arrive
+    /// as cancellation, which is not something to report: the list simply keeps
+    /// what it had.
     func refreshSessions() async {
         guard let api, isConnected else { return }
         isLoadingSessions = true
@@ -153,7 +160,10 @@ final class AppStore: ObservableObject {
         do {
             sessions = try await api.sessions()
             lastError = nil
+            isRetrying = false
+            retryCount = 0
         } catch {
+            if RetryPolicy.isCancellation(error) { return }
             lastError = Self.describe(error)
         }
     }
@@ -167,6 +177,7 @@ final class AppStore: ObservableObject {
             await refreshSessions()
             return sessionID
         } catch {
+            if RetryPolicy.isCancellation(error) { return nil }
             lastError = Self.describe(error)
             return nil
         }

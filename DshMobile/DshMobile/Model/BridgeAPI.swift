@@ -126,6 +126,9 @@ struct BridgeAPI {
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
+                // A withdrawn request is not a network failure: surface it as
+                // cancellation so callers never render "canceled" as an error.
+                if RetryPolicy.isCancellation(error) { throw CancellationError() }
                 throw BridgeError.transport(error.localizedDescription)
             }
         })
