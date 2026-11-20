@@ -26,8 +26,11 @@ struct FilesView: View {
                     Button("关闭") { dismiss() }
                 }
             }
-            .sheet(item: $previewTarget) { file in
-                FilePreviewView(file: file)
+            // The preview needs the full screen: Quick Look manages its own
+            // navigation bar, and embedding it inside this sheet left two bars
+            // competing for the same space.
+            .fullScreenCover(item: $previewTarget) { file in
+                FilePreviewSheet(file: file)
             }
             .confirmationDialog(
                 "删除这个文件？",
