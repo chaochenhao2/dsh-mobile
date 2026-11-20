@@ -36,6 +36,12 @@ const KEEPALIVE_MS = 15_000
 const STATE_POLL_MS = 2_000
 const BEACON_INTERVAL_MS = 3_000
 const TOOL_RESULT_CHARS = 4_000
+/** Upper bound on one archive response, so a phone is never sent a huge body. */
+const MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
+/** Upper bound on entries, so a folder with millions of files cannot stall. */
+const MAX_ARCHIVE_ENTRIES = 5_000
+/** Recursion bound for directory selection; guards against symlink loops. */
+const MAX_ARCHIVE_DEPTH = 32
 
 /**
  * Describe what the app can rely on, so it can degrade instead of failing.
@@ -781,6 +787,395 @@ function startStateWatcher(ctx, sessionId, abort, write, initial) {
 }
 
 // ---------------------------------------------------------------------------
+// Workspace files
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve the directory a Session's files are browsed from.
+ *
+ * A live Session answers from the working-directory service. A cold one is read
+ * from its recorded `cwd` through the Session list, which is a warm read and
+ * avoids activating an Agent merely to browse files.
+ * @param ctx - the Host plugin context.
+ * @param controller - the Host Session API.
+ * @param sessionId - the Session whose root is wanted.
+ * @param signal - cancellation for the list read.
+ * @returns the absolute root directory, or null when none can be determined.
+ */
+async function sessionRoot(ctx, controller, sessionId, signal) {
+  const session = liveSession(ctx, sessionId)
+  if (session !== undefined) {
+    const working = ctx.get('workingDirectory')
+    if (working !== undefined) {
+      try {
+        const directory = working.get(session)
+        if (typeof directory === 'string' && directory !== '') return directory
+      } catch (error) {
+        ctx.logger.warn(`dsh-mobile-bridge: working directory read failed: ${error?.message ?? error}`)
+      }
+    }
+  }
+  try {
+    const list = await controller.list({}, signal)
+    const row = (list.items ?? []).find((item) => item.sessionId === sessionId)
+    if (typeof row?.cwd === 'string' && row.cwd !== '') return row.cwd
+  } catch (error) {
+    ctx.logger.warn(`dsh-mobile-bridge: Session root lookup failed: ${error?.message ?? error}`)
+  }
+  const registry = ctx.get('workspaceRegistry')
+  if (registry !== undefined) {
+    try {
+      const first = registry.list()[0]
+      if (typeof first?.path === 'string') return first.path
+    } catch {
+      // No registry opinion; fall through to the process directory.
+    }
+  }
+  return null
+}
+
+/**
+ * Read the Session's file scope, or null when the filesystem is unavailable.
+ * @param ctx - the Host plugin context.
+ * @param controller - the Host Session API.
+ * @param sessionId - the Session being browsed.
+ * @param signal - cancellation for the root lookup.
+ * @returns the scope the file service expects.
+ */
+async function fileScope(ctx, controller, sessionId, signal) {
+  const root = await sessionRoot(ctx, controller, sessionId, signal)
+  if (root === null) return null
+  return { sessionId, workspaceRoot: root }
+}
+
+/**
+ * Stream a ZIP of the selected files and folders.
+ *
+ * Binary rather than JSON: a base64 body would inflate the transfer by a third
+ * and force the phone to decode it before it can write the file.
+ * @param ctx - the Host plugin context.
+ * @param controller - the Host Session API.
+ * @param res - the response being written.
+ * @param sessionId - the Session whose files are read.
+ * @param selection - absolute paths chosen on the phone.
+ */
+async function sendArchive(ctx, controller, res, sessionId, selection) {
+  const service = ctx.get('workspaceFiles')
+  const signal = new AbortController().signal
+  const scope = await fileScope(ctx, controller, sessionId, signal)
+  if (service === undefined || scope === null) {
+    sendJson(res, 404, { error: 'unsupported', message: 'This Harness exposes no workspace files.' })
+    return
+  }
+  const { entries, skipped } = await collectSelection(ctx, service, scope, selection, signal)
+  if (entries.length === 0) {
+    sendJson(res, 422, {
+      error: 'archive/empty',
+      message: 'Nothing could be read from the selection.',
+      skipped: skipped.slice(0, 20),
+    })
+    return
+  }
+  const archive = buildZip(entries)
+  // Name the archive after the single chosen item, or after the folder when the
+  // selection is a mix; a multi-item archive named after one of its members
+  // would mislead the person about what they downloaded.
+  const singleTop = selection.length === 1 ? baseName(selection[0]) : null
+  const rawName = singleTop !== null && entries.length === 1
+    ? singleTop
+    : `${baseName(scope.workspaceRoot)}-${entries.length}项`
+  const fileName = rawName.toLowerCase().endsWith('.zip') ? rawName : `${rawName}.zip`
+  res.writeHead(200, {
+    'content-type': 'application/zip',
+    'content-length': String(archive.length),
+    'content-disposition': `attachment; filename*=UTF-8''${encodeURIComponent(fileName)}`,
+    'cache-control': 'no-store',
+    ...(skipped.length === 0 ? {} : { 'x-skipped-entries': String(skipped.length) }),
+    ...corsHeaders(),
+    'access-control-expose-headers': 'x-skipped-entries, content-disposition',
+  })
+  res.end(archive)
+}
+
+/**
+ * List one directory level for the phone.
+ *
+ * `path` is optional; without it the Session's own root is listed. The parent is
+ * reported so the app can render a `..` row without re-deriving paths, and a
+ * selection at the filesystem root simply has no parent.
+ * @param ctx - the Host plugin context.
+ * @param controller - the Host Session API.
+ * @param sessionId - the Session being browsed.
+ * @param requested - absolute or workspace-relative directory path.
+ * @param signal - cancellation for the read.
+ * @returns the listing with its parent, or null when files are unavailable.
+ */
+async function listFiles(ctx, controller, sessionId, requested, signal) {
+  const service = ctx.get('workspaceFiles')
+  const scope = await fileScope(ctx, controller, sessionId, signal)
+  if (service === undefined || scope === null) return null
+  const target = typeof requested === 'string' && requested !== '' ? requested : scope.workspaceRoot
+  const listing = await service.list(scope, target, signal)
+  // The backend may answer with the path verbatim (relative when the request
+  // was relative). Resolve it against the workspace root so every entry path the
+  // phone receives is absolute and directly usable by the archive request.
+  const absolute = absolutize(scope.workspaceRoot, target, listing.path)
+  const parent = parentOf(absolute)
+  return {
+    root: scope.workspaceRoot,
+    path: absolute,
+    parent,
+    truncated: listing.truncated === true,
+    entries: (listing.entries ?? []).map((entry) => ({
+      name: entry.name,
+      type: entry.type,
+      size: typeof entry.size === 'number' ? entry.size : null,
+      path: joinPath(absolute, entry.name),
+    })),
+  }
+}
+
+/**
+ * Produce an absolute directory path from whatever the backend echoed back.
+ * @param root - the Session's workspace root.
+ * @param requested - the path that was asked for.
+ * @param reported - the path the backend returned, possibly relative or empty.
+ * @returns an absolute path.
+ */
+function absolutize(root, requested, reported) {
+  const candidate = typeof reported === 'string' && reported !== '' ? reported : requested
+  if (typeof candidate !== 'string' || candidate === '') return root
+  if (isAbsolutePath(candidate)) return candidate
+  return joinPath(root, candidate)
+}
+
+/**
+ * Whether a path already names a filesystem location.
+ * @param path - the path to inspect.
+ * @returns true for a drive-letter, UNC, or POSIX absolute path.
+ */
+function isAbsolutePath(path) {
+  if (path.startsWith('/')) return true
+  if (path.startsWith('\\\\')) return true
+  return /^[A-Za-z]:[\\/]/.test(path)
+}
+
+/**
+ * Join one path segment the way the host filesystem expects.
+ * @param parent - absolute parent directory.
+ * @param name - child name.
+ * @returns the joined path using the host separator.
+ */
+function joinPath(parent, name) {
+  if (parent.endsWith('/') || parent.endsWith('\\')) return `${parent}${name}`
+  return `${parent}${platformIsWindows() ? '\\' : '/'}${name}`
+}
+
+/**
+ * Report the parent directory, or null at the filesystem root.
+ * @param path - absolute path.
+ * @returns the parent path.
+ */
+function parentOf(path) {
+  const trimmed = path.replace(/[\\/]+$/, '')
+  const separatorIndex = Math.max(trimmed.lastIndexOf('/'), trimmed.lastIndexOf('\\'))
+  if (separatorIndex < 0) return null
+  // Keep "C:\" intact rather than collapsing it to "C:".
+  if (separatorIndex === 2 && /^[A-Za-z]:/.test(trimmed)) return trimmed.slice(0, 3)
+  if (separatorIndex === 0) return '/'
+  return trimmed.slice(0, separatorIndex)
+}
+
+/**
+ * Whether the host uses backslash separators.
+ * @returns true on Windows.
+ */
+function platformIsWindows() {
+  return process.platform === 'win32'
+}
+
+// ---------------------------------------------------------------------------
+// Zip archive
+// ---------------------------------------------------------------------------
+
+/** CRC-32 lookup table, built once. */
+const CRC_TABLE = (() => {
+  const table = new Uint32Array(256)
+  for (let index = 0; index < 256; index += 1) {
+    let value = index
+    for (let bit = 0; bit < 8; bit += 1) {
+      value = (value & 1) !== 0 ? (0xedb88320 ^ (value >>> 1)) >>> 0 : value >>> 1
+    }
+    table[index] = value >>> 0
+  }
+  return table
+})()
+
+/**
+ * Compute the CRC-32 of a buffer, as the ZIP format requires.
+ * @param buffer - the bytes to checksum.
+ * @returns the unsigned checksum.
+ */
+function crc32(buffer) {
+  let crc = 0xffffffff
+  for (let index = 0; index < buffer.length; index += 1) {
+    crc = (CRC_TABLE[(crc ^ buffer[index]) & 0xff] ^ (crc >>> 8)) >>> 0
+  }
+  return (crc ^ 0xffffffff) >>> 0
+}
+
+/**
+ * Pack entries into a store-only ZIP archive.
+ *
+ * Storing rather than deflating keeps this dependency-free and predictable;
+ * text files lose some size, but the transfer is a LAN hop and the alternative
+ * is bundling a compressor into a plugin that has no dependencies at all.
+ * @param entries - ordered `{ name, data }` pairs; names use forward slashes.
+ * @param now - timestamp applied to every entry.
+ * @returns the archive bytes.
+ */
+function buildZip(entries, now = new Date()) {
+  const localParts = []
+  const centralParts = []
+  let offset = 0
+  const dosTime = ((now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1)) & 0xffff
+  const dosDate = (((now.getFullYear() - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate()) & 0xffff
+
+  for (const entry of entries) {
+    const nameBytes = Buffer.from(entry.name, 'utf8')
+    const data = entry.data
+    const checksum = crc32(data)
+
+    const local = Buffer.alloc(30)
+    local.writeUInt32LE(0x04034b50, 0)
+    local.writeUInt16LE(20, 4)
+    // Bit 11 marks the name as UTF-8 so non-ASCII paths survive unzip.
+    local.writeUInt16LE(0x0800, 6)
+    local.writeUInt16LE(0, 8)
+    local.writeUInt16LE(dosTime, 10)
+    local.writeUInt16LE(dosDate, 12)
+    local.writeUInt32LE(checksum, 14)
+    local.writeUInt32LE(data.length, 18)
+    local.writeUInt32LE(data.length, 22)
+    local.writeUInt16LE(nameBytes.length, 26)
+    local.writeUInt16LE(0, 28)
+    localParts.push(local, nameBytes, data)
+
+    const central = Buffer.alloc(46)
+    central.writeUInt32LE(0x02014b50, 0)
+    central.writeUInt16LE(20, 4)
+    central.writeUInt16LE(20, 6)
+    central.writeUInt16LE(0x0800, 8)
+    central.writeUInt16LE(0, 10)
+    central.writeUInt16LE(dosTime, 12)
+    central.writeUInt16LE(dosDate, 14)
+    central.writeUInt32LE(checksum, 16)
+    central.writeUInt32LE(data.length, 20)
+    central.writeUInt32LE(data.length, 24)
+    central.writeUInt16LE(nameBytes.length, 28)
+    central.writeUInt16LE(0, 30)
+    central.writeUInt16LE(0, 32)
+    central.writeUInt16LE(0, 34)
+    central.writeUInt16LE(0, 36)
+    central.writeUInt32LE(0, 38)
+    central.writeUInt32LE(offset, 42)
+    centralParts.push(central, nameBytes)
+
+    offset += local.length + nameBytes.length + data.length
+  }
+
+  const centralSize = centralParts.reduce((total, part) => total + part.length, 0)
+  const end = Buffer.alloc(22)
+  end.writeUInt32LE(0x06054b50, 0)
+  end.writeUInt16LE(0, 4)
+  end.writeUInt16LE(0, 6)
+  end.writeUInt16LE(entries.length, 8)
+  end.writeUInt16LE(entries.length, 10)
+  end.writeUInt32LE(centralSize, 12)
+  end.writeUInt32LE(offset, 16)
+  end.writeUInt16LE(0, 20)
+
+  return Buffer.concat([...localParts, ...centralParts, end])
+}
+
+/**
+ * Collect every file under one selection, recursing into directories.
+ *
+ * Entry names are relative to the selection so the archive unzips into a tidy
+ * folder rather than replaying the absolute path from the computer.
+ * @param ctx - the Host plugin context.
+ * @param service - the workspace files service.
+ * @param scope - the Session's file scope.
+ * @param selection - absolute paths chosen on the phone.
+ * @param signal - cancellation for the reads.
+ * @returns collected entries and the paths that could not be read.
+ */
+async function collectSelection(ctx, service, scope, selection, signal) {
+  const entries = []
+  const skipped = []
+  let total = 0
+  const seenDirectories = new Set()
+
+  /**
+   * Add one path, descending into directories.
+   * @param absolute - absolute path to include.
+   * @param prefix - archive name prefix, empty for a top-level selection.
+   * @param depth - recursion depth, bounded to stop link loops.
+   */
+  const add = async (absolute, prefix, depth) => {
+    if (signal.aborted) return
+    if (total > MAX_ARCHIVE_BYTES || entries.length > MAX_ARCHIVE_ENTRIES) return
+    const name = prefix === '' ? baseName(absolute) : prefix
+    // `stat` reports a byte count for regular files only. Treating a missing
+    // size as "directory" keeps a zero-byte file readable and still descends,
+    // because the listing below decides which one this really is.
+    let listing = null
+    try {
+      listing = await service.list(scope, absolute, signal)
+    } catch {
+      // Not a directory: fall through to the file read.
+    }
+    if (listing !== null) {
+      if (seenDirectories.has(absolute) || depth > MAX_ARCHIVE_DEPTH) return
+      seenDirectories.add(absolute)
+      for (const child of listing.entries ?? []) {
+        await add(joinPath(absolutize(scope.workspaceRoot, absolute, listing.path), child.name), `${name}/${child.name}`, depth + 1)
+      }
+      return
+    }
+    try {
+      const file = await service.readBytes(scope, absolute, {}, signal)
+      const data = Buffer.from(file.data)
+      total += data.length
+      if (total > MAX_ARCHIVE_BYTES) {
+        skipped.push(`${absolute}: archive exceeds ${MAX_ARCHIVE_BYTES} bytes`)
+        return
+      }
+      entries.push({ name, data })
+    } catch (error) {
+      skipped.push(`${absolute}: ${error?.message ?? error}`)
+    }
+  }
+
+  for (const selected of selection) {
+    await add(selected, '', 0)
+    if (total > MAX_ARCHIVE_BYTES || entries.length > MAX_ARCHIVE_ENTRIES) break
+  }
+  return { entries, skipped, total }
+}
+
+/**
+ * Take the last path segment, treating both separators as separators.
+ * @param path - absolute path.
+ * @returns the final segment.
+ */
+function baseName(path) {
+  const trimmed = path.replace(/[\\/]+$/, '')
+  const separatorIndex = Math.max(trimmed.lastIndexOf('/'), trimmed.lastIndexOf('\\'))
+  return separatorIndex < 0 ? trimmed : trimmed.slice(separatorIndex + 1)
+}
+
+// ---------------------------------------------------------------------------
 // Session reads
 // ---------------------------------------------------------------------------
 
@@ -1222,6 +1617,28 @@ async function handleRequest(ctx, settings, req, res) {
       }
       if (tail === 'stream' && req.method === 'GET') {
         await streamSession(ctx, req, res, sessionId, url)
+        return
+      }
+      if (tail === 'files' && req.method === 'GET') {
+        const signal = new AbortController().signal
+        const listing = await listFiles(ctx, controller, sessionId, url.searchParams.get('path'), signal)
+        if (listing === null) {
+          sendJson(res, 404, { error: 'unsupported', message: 'This Harness exposes no workspace files.' })
+          return
+        }
+        sendJson(res, 200, listing)
+        return
+      }
+      if (tail === 'files' && segments[4] === 'archive' && req.method === 'POST') {
+        const body = await readJsonBody(req)
+        const selection = Array.isArray(body.paths)
+          ? body.paths.filter((value) => typeof value === 'string' && value !== '')
+          : []
+        if (selection.length === 0) {
+          sendJson(res, 400, { error: 'bad-request', message: '`paths` must list at least one path.' })
+          return
+        }
+        await sendArchive(ctx, controller, res, sessionId, selection)
         return
       }
       if (tail === 'prompt' && req.method === 'POST') {

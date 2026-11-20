@@ -3,10 +3,13 @@ import SwiftUI
 /// One Session's conversation, followed live.
 struct ChatView: View {
     @StateObject private var chat: ChatStore
+    /// The shared pairing, used by sheets that need their own transport (files).
+    @EnvironmentObject private var store: AppStore
     @State private var draft = ""
     /// Node ids whose reasoning section the person opened by hand.
     @State private var expandedReasoning: Set<String> = []
     @State private var showsModelPicker = false
+    @State private var showsFileBrowser = false
     @FocusState private var isComposerFocused: Bool
 
     private let title: String
@@ -62,6 +65,12 @@ struct ChatView: View {
                         Image(systemName: "cpu")
                     }
                     Menu {
+                        Button {
+                            showsFileBrowser = true
+                        } label: {
+                            Label("工作区文件", systemImage: "folder")
+                        }
+                        Divider()
                         Toggle("显示上下文注入", isOn: $chat.showNotices)
                         Button("重新读取") {
                             Task { await chat.load() }
@@ -74,6 +83,15 @@ struct ChatView: View {
         }
         .sheet(isPresented: $showsModelPicker) {
             ModelPickerView(chat: chat)
+        }
+        .sheet(isPresented: $showsFileBrowser) {
+            if let api = store.api {
+                FileBrowserView(sessionID: chat.sessionID, api: api)
+            } else {
+                Text("尚未连接。")
+                    .foregroundStyle(Theme.textSecondary)
+                    .padding(32)
+            }
         }
         .task {
             chat.attachRetryReporter()

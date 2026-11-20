@@ -1,0 +1,54 @@
+import Foundation
+
+/// One entry inside a browsed directory.
+struct FileEntry: Decodable, Identifiable, Equatable {
+    let name: String
+    /// `file`, `directory`, or `other`.
+    let type: String
+    let size: Int?
+    /// Absolute path on the computer, which is what the archive request needs.
+    let path: String
+
+    var id: String { path }
+    var isDirectory: Bool { type == "directory" }
+
+    /// A compact size label, or nil for a directory.
+    var sizeText: String? {
+        guard let size else { return nil }
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        formatter.allowedUnits = [.useKB, .useMB, .useGB]
+        return formatter.string(fromByteCount: Int64(size))
+    }
+}
+
+/// One directory level, as `GET /api/session/:id/files` reports it.
+struct FileListing: Decodable, Equatable {
+    /// The Session's workspace root.
+    let root: String
+    /// The directory being shown.
+    let path: String
+    /// The parent directory, or nil at the filesystem root.
+    let parent: String?
+    let truncated: Bool
+    let entries: [FileEntry]
+
+    /// Entries with directories first, then files, each alphabetically.
+    ///
+    /// The bridge returns the backend's name order; a person browsing wants
+    /// folders grouped before loose files.
+    var sorted: [FileEntry] {
+        entries.sorted { left, right in
+            if left.isDirectory != right.isDirectory { return left.isDirectory }
+            return left.name.localizedStandardCompare(right.name) == .orderedAscending
+        }
+    }
+}
+
+/// One item held in the phone's Downloads folder.
+struct DownloadedFile: Identifiable, Equatable {
+    let id = UUID()
+    let name: String
+    let url: URL
+    let bytes: Int
+}

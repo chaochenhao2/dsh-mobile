@@ -56,6 +56,17 @@ struct BridgeAPI {
         return URLSession(configuration: configuration)
     }()
 
+    /// Archive downloads can take longer than a JSON call on a large folder,
+    /// so they get their own budget instead of the 15-second interactive one.
+    private static let downloadSession: URLSession = {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.waitsForConnectivity = false
+        configuration.timeoutIntervalForRequest = 300
+        configuration.timeoutIntervalForResource = 900
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        return URLSession(configuration: configuration)
+    }()
+
     init(endpoint: Endpoint, onRetry: (@Sendable (Int, Error) -> Void)? = nil) {
         self.endpoint = endpoint
         self.onRetry = onRetry
@@ -259,6 +270,71 @@ struct BridgeAPI {
             body: body,
             session: Self.session
         )
+    }
+
+    /// List one directory level inside a Session's workspace.
+    ///
+    /// `path` is optional; omitting it lists the Session's own root, which is
+    /// what the file browser opens on.
+    /// @param sessionID - Session whose files are browsed.
+    /// @param path - absolute or workspace-relative directory, or nil for the root.
+    /// @returns the listing, including the parent for a `..` row.
+    func listFiles(sessionID: String, path: String?) async throws -> FileListing {
+        var requestPath = "/api/session/\(escaped(sessionID))/files"
+        if let path, !path.isEmpty {
+            let encoded = path.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? path
+            requestPath += "?path=\(encoded)"
+        }
+        return try await send("GET", requestPath, body: nil, session: Self.session)
+    }
+
+    /// Download the selected paths as one ZIP archive.
+    ///
+    /// Folders are expanded on the computer, so the phone receives a single
+    /// streamed body and writes one file rather than walking the tree itself.
+    /// @param sessionID - Session whose files are read.
+    /// @param paths - absolute paths chosen on the phone.
+    /// @returns the archive bytes and the suggested file name.
+    func downloadArchive(sessionID: String, paths: [String]) async throws -> (data: Data, fileName: String) {
+        let body = try JSONSerialization.data(withJSONObject: ["paths": paths])
+        let request = try makeRequest(
+            "POST",
+            "/api/session/\(escaped(sessionID))/files/archive",
+            body: body
+        )
+        return try await Retry.run(maxAttempts: RetryPolicy.maxAttempts) {
+            do {
+                let (data, response) = try await Self.downloadSession.data(for: request)
+                guard let http = response as? HTTPURLResponse else {
+                    throw BridgeError.transport("没有收到 HTTP 响应")
+                }
+                guard (200..<300).contains(http.statusCode) else {
+                    let text = String(data: data, encoding: .utf8) ?? ""
+                    throw BridgeError.http(status: http.statusCode, body: text)
+                }
+                return (data, Self.archiveName(from: http))
+            } catch let error as BridgeError {
+                throw error
+            } catch {
+                if RetryPolicy.isCancellation(error) { throw CancellationError() }
+                throw BridgeError.transport(error.localizedDescription)
+            }
+        }
+    }
+
+    /// Read the suggested archive name from the response headers.
+    ///
+    /// The bridge sends an RFC 5987 `filename*` with percent-encoding, which is
+    /// what keeps a non-ASCII name intact across the wire.
+    /// @param response - the HTTP response.
+    /// @returns the decoded name, falling back to a generic one.
+    private static func archiveName(from response: HTTPURLResponse) -> String {
+        let raw = response.value(forHTTPHeaderField: "content-disposition") ?? ""
+        if let range = raw.range(of: "filename*=UTF-8''") {
+            let encoded = String(raw[range.upperBound...]).trimmingCharacters(in: .whitespaces)
+            if let decoded = encoded.removingPercentEncoding, !decoded.isEmpty { return decoded }
+        }
+        return "dsh-files.zip"
     }
 
     /// Follow one Session, yielding every operator the bridge emits.
