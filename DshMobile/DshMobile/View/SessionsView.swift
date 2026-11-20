@@ -74,14 +74,14 @@ struct SessionsView: View {
 
     private var header: some View {
         HStack(spacing: 10) {
-            StatusDot(color: Theme.success)
+            StatusDot(color: store.isRetrying ? Theme.warning : Theme.success)
             VStack(alignment: .leading, spacing: 2) {
                 Text(store.hostSummary)
                     .font(.system(size: 14, weight: .semibold))
                     .foregroundStyle(Theme.textPrimary)
-                Text("\(store.sessions.count) 个会话")
+                Text(store.isRetrying ? "网络不稳定，正在重试…" : "\(store.sessions.count) 个会话")
                     .font(.system(size: 12))
-                    .foregroundStyle(Theme.textTertiary)
+                    .foregroundStyle(store.isRetrying ? Theme.warning : Theme.textTertiary)
             }
             Spacer()
             if store.isLoadingSessions {

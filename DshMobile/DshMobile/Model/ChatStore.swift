@@ -18,6 +18,11 @@ final class ChatStore: ObservableObject {
     @Published private(set) var isLoading = true
     @Published private(set) var tick = 0
     @Published var showNotices = false
+    /// How many times the in-flight request has been retried, for the status line.
+    @Published private(set) var retryCount = 0
+    @Published private(set) var isRetrying = false
+    /// Why the last retry happened, shown while reconnecting.
+    @Published private(set) var lastRetryReason: String?
 
     /// The model this Session will run its next prompt on.
     @Published private(set) var model: SessionModel?
@@ -34,6 +39,30 @@ final class ChatStore: ObservableObject {
         self.sessionID = sessionID
         self.title = title
         self.api = api
+    }
+
+    /// Replace the API with one whose retry reporter feeds this store.
+    ///
+    /// The reporter is attached after initialization because it captures `self`;
+    /// a stored property cannot reference the instance being built.
+    func attachRetryReporter() {
+        api.onRetry = { [weak self] attempt, error in
+            Task { @MainActor in
+                guard let self else { return }
+                self.retryCount = attempt
+                self.isRetrying = true
+                self.lastRetryReason = Self.describe(error)
+            }
+        }
+    }
+
+    /// Record that the in-flight request finally succeeded or gave up.
+    private func clearRetryState() {
+        if isRetrying || retryCount > 0 {
+            retryCount = 0
+            isRetrying = false
+            lastRetryReason = nil
+        }
     }
 
     deinit {
@@ -78,6 +107,7 @@ final class ChatStore: ObservableObject {
             model = detail.model
             if detail.state.running { startedAt = startedAt ?? Date() }
             lastError = nil
+            clearRetryState()
         } catch {
             lastError = Self.describe(error)
         }
@@ -94,6 +124,7 @@ final class ChatStore: ObservableObject {
         defer { isLoadingCatalog = false }
         do {
             catalog = try await api.models()
+            clearRetryState()
         } catch {
             lastError = Self.describe(error)
         }
@@ -122,6 +153,7 @@ final class ChatStore: ObservableObject {
             )
             self.model = result.current ?? result.selected
             lastError = nil
+            clearRetryState()
             return true
         } catch {
             lastError = Self.describe(error)
@@ -129,18 +161,51 @@ final class ChatStore: ObservableObject {
         }
     }
 
+    /// Open the live stream, reopening it after a transient disconnect.
+    ///
+    /// A phone loses Wi-Fi constantly — a held door, a lift, the screen locking.
+    /// The stream is a long-lived connection, so the recovery belongs here: the
+    /// loop reconnects with backoff and only reports an error once the attempts
+    /// are exhausted. The reopening snapshot rebuilds the transcript, so no
+    /// operator replay is needed.
     private func follow() {
         streamTask?.cancel()
         streamTask = Task { [weak self] in
             guard let self else { return }
-            do {
-                for try await frame in self.frames() {
+            var attempt = 0
+            while !Task.isCancelled {
+                do {
+                    for try await frame in self.frames() {
+                        if Task.isCancelled { break }
+                        // Any frame proves the connection is healthy again.
+                        if attempt > 0 {
+                            attempt = 0
+                            self.clearRetryState()
+                        }
+                        self.apply(frame)
+                    }
+                    // The server closed an open stream; treat it like a drop.
                     if Task.isCancelled { break }
-                    self.apply(frame)
-                }
-            } catch {
-                if !Task.isCancelled {
-                    self.lastError = Self.describe(error)
+                    throw BridgeError.transport("连接已断开")
+                } catch is CancellationError {
+                    break
+                } catch {
+                    if Task.isCancelled { break }
+                    guard RetryPolicy.isTransient(error) else {
+                        self.lastError = Self.describe(error)
+                        break
+                    }
+                    attempt += 1
+                    guard attempt < RetryPolicy.maxAttempts else {
+                        self.isRetrying = false
+                        self.lastError = Self.describe(error)
+                        break
+                    }
+                    let wait = RetryPolicy.delay(afterAttempt: attempt - 1)
+                    self.retryCount = attempt
+                    self.isRetrying = true
+                    self.lastRetryReason = Self.describe(error)
+                    try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
                 }
             }
         }
@@ -228,12 +293,16 @@ final class ChatStore: ObservableObject {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
         do {
-            try await api.prompt(sessionID: sessionID, text: trimmed)
+            // One identity per submission: a retried send is deduplicated by the
+            // Session, so a dropped response cannot enqueue the message twice.
+            let requestID = UUID().uuidString
+            try await api.prompt(sessionID: sessionID, text: trimmed, requestID: requestID)
             isRunning = true
             startedAt = Date()
             lastError = nil
             return true
         } catch {
+            isRetrying = false
             lastError = Self.describe(error)
             return false
         }

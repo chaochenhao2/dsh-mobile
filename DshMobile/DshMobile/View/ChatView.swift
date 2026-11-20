@@ -55,6 +55,7 @@ struct ChatView: View {
             ModelPickerView(chat: chat)
         }
         .task {
+            chat.attachRetryReporter()
             await chat.start()
         }
         .onDisappear {
@@ -272,11 +273,17 @@ struct ChatView: View {
                     .padding(.horizontal, 16)
             }
             HStack(spacing: 6) {
-                StatusDot(color: chat.isRunning ? Theme.success : Theme.textTertiary)
-                TimelineView(.periodic(from: .now, by: 1)) { _ in
-                    Text(chat.runningDescription)
-                        .font(.system(size: 11, design: .rounded))
-                        .foregroundStyle(Theme.textTertiary)
+                StatusDot(color: chat.isRetrying ? Theme.warning : (chat.isRunning ? Theme.success : Theme.textTertiary))
+                if chat.isRetrying {
+                    Text("重连中… \(chat.retryCount)/\(RetryPolicy.maxAttempts - 1)")
+                        .font(.system(size: 11, weight: .medium, design: .rounded))
+                        .foregroundStyle(Theme.warning)
+                } else {
+                    TimelineView(.periodic(from: .now, by: 1)) { _ in
+                        Text(chat.runningDescription)
+                            .font(.system(size: 11, design: .rounded))
+                            .foregroundStyle(Theme.textTertiary)
+                    }
                 }
                 if let model = chat.model {
                     Text("·").foregroundStyle(Theme.textTertiary)

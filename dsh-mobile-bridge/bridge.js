@@ -1020,8 +1020,14 @@ async function handleRequest(ctx, settings, req, res) {
           return
         }
         const accept = new AbortController()
+        // Honour a caller-supplied identity so a retried prompt is deduplicated
+        // by the Session instead of being enqueued twice. The app reuses its
+        // request id across retries of the same submission.
+        const requestId = typeof body.requestId === 'string' && body.requestId !== ''
+          ? body.requestId
+          : randomUUID()
         const result = await controller.prompt({
-          requestId: randomUUID(),
+          requestId,
           sessionId,
           mode: body.mode === 'steer' ? 'steer' : 'queue',
           content: [{ type: 'text', text }],
@@ -1029,7 +1035,7 @@ async function handleRequest(ctx, settings, req, res) {
             ? { clientTimeZone: body.clientTimeZone }
             : {}),
         }, accept.signal)
-        sendJson(res, 200, result)
+        sendJson(res, 200, { ...result, requestId })
         return
       }
       if (tail === 'cancel' && req.method === 'POST') {

@@ -21,6 +21,10 @@ final class AppStore: ObservableObject {
     @Published var lastError: String?
     @Published var endpoint: Endpoint
 
+    /// A retry in flight, for the connection banner.
+    @Published private(set) var isRetrying = false
+    @Published private(set) var retryCount = 0
+
     private static let storageKey = "com.dshmobile.endpoint"
 
     init() {
@@ -39,8 +43,19 @@ final class AppStore: ObservableObject {
     }
 
     /// The transport for the current endpoint, when it is complete.
+    ///
+    /// The retry reporter is attached here so every request made through this
+    /// store feeds the connection banner.
     var api: BridgeAPI? {
-        endpoint.isValid ? BridgeAPI(endpoint: endpoint) : nil
+        guard endpoint.isValid else { return nil }
+        var client = BridgeAPI(endpoint: endpoint)
+        client.onRetry = { [weak self] attempt, _ in
+            Task { @MainActor in
+                self?.isRetrying = true
+                self?.retryCount = attempt
+            }
+        }
+        return client
     }
 
     /// A one-line description of the connected computer.
@@ -69,6 +84,8 @@ final class AppStore: ObservableObject {
         do {
             info = try await api.info()
             sessions = try await api.sessions()
+            isRetrying = false
+            retryCount = 0
             phase = .connected
             persist()
             return
@@ -83,6 +100,8 @@ final class AppStore: ObservableObject {
                     info = try await probe.info()
                     sessions = try await probe.sessions()
                     endpoint = candidate
+                    isRetrying = false
+                    retryCount = 0
                     phase = .connected
                     lastError = nil
                     persist()
@@ -92,6 +111,7 @@ final class AppStore: ObservableObject {
                 }
             }
         }
+        isRetrying = false
         info = nil
         phase = .idle
     }

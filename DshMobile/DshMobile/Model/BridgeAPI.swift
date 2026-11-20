@@ -34,6 +34,9 @@ enum BridgeError: LocalizedError {
 struct BridgeAPI {
     let endpoint: Endpoint
 
+    /// Reports each retry to the caller so the UI can show "reconnecting".
+    var onRetry: (@Sendable (Int, Error) -> Void)?
+
     private static let session: URLSession = {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.waitsForConnectivity = false
@@ -53,8 +56,9 @@ struct BridgeAPI {
         return URLSession(configuration: configuration)
     }()
 
-    init(endpoint: Endpoint) {
+    init(endpoint: Endpoint, onRetry: (@Sendable (Int, Error) -> Void)? = nil) {
         self.endpoint = endpoint
+        self.onRetry = onRetry
     }
 
     // MARK: - Requests
@@ -73,7 +77,24 @@ struct BridgeAPI {
         return request
     }
 
-    private func send<T: Decodable>(_ method: String, _ path: String, body: [String: Any]?, session: URLSession) async throws -> T {
+    /// Perform one request, retrying transient failures.
+    ///
+    /// Idempotent reads and writes are safe to repeat. A prompt carries the
+    /// caller's request id so the Session deduplicates a repeat rather than
+    /// enqueueing the message twice.
+    /// @param method - HTTP method.
+    /// @param path - absolute path with query.
+    /// @param body - optional JSON body.
+    /// @param session - the URL session carrying the request.
+    /// @param retryable - whether a transient failure may be retried.
+    /// @returns the decoded response.
+    private func send<T: Decodable>(
+        _ method: String,
+        _ path: String,
+        body: [String: Any]?,
+        session: URLSession,
+        retryable: Bool = true
+    ) async throws -> T {
         let payload: Data?
         if let body {
             payload = try? JSONSerialization.data(withJSONObject: body)
@@ -81,25 +102,33 @@ struct BridgeAPI {
             payload = method == "POST" ? Data("{}".utf8) : nil
         }
         let request = try makeRequest(method, path, body: payload)
-        do {
-            let (data, response) = try await session.data(for: request)
-            guard let http = response as? HTTPURLResponse else {
-                throw BridgeError.transport("没有收到 HTTP 响应")
-            }
-            guard (200..<300).contains(http.statusCode) else {
-                throw BridgeError.http(status: http.statusCode, body: String(data: data, encoding: .utf8) ?? "")
-            }
+        let attempts = retryable ? RetryPolicy.maxAttempts : 1
+        let notify = onRetry
+        return try await Retry.run(maxAttempts: attempts, onRetry: { attempt, error, _ in
+            notify?(attempt, error)
+        }, operation: {
             do {
-                let decoder = JSONDecoder()
-                return try decoder.decode(T.self, from: data)
+                let (data, response) = try await session.data(for: request)
+                guard let http = response as? HTTPURLResponse else {
+                    throw BridgeError.transport("没有收到 HTTP 响应")
+                }
+                guard (200..<300).contains(http.statusCode) else {
+                    throw BridgeError.http(status: http.statusCode, body: String(data: data, encoding: .utf8) ?? "")
+                }
+                do {
+                    let decoder = JSONDecoder()
+                    return try decoder.decode(T.self, from: data)
+                } catch {
+                    throw BridgeError.decoding(error.localizedDescription)
+                }
+            } catch let error as BridgeError {
+                throw error
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
-                throw BridgeError.decoding(error.localizedDescription)
+                throw BridgeError.transport(error.localizedDescription)
             }
-        } catch let error as BridgeError {
-            throw error
-        } catch {
-            throw BridgeError.transport(error.localizedDescription)
-        }
+        })
     }
 
     // MARK: - Endpoints
@@ -122,11 +151,23 @@ struct BridgeAPI {
         try await send("GET", "/api/session/\(escaped(sessionID))", body: nil, session: Self.session)
     }
 
-    func prompt(sessionID: String, text: String) async throws {
+    /// Submit a prompt to one Session.
+    ///
+    /// `requestID` identifies this submission across retries: the bridge passes
+    /// it through and the Session deduplicates on it, so a retried send is not
+    /// enqueued twice.
+    /// @param sessionID - Session receiving the prompt.
+    /// @param text - what the person typed.
+    /// @param requestID - stable identity for this submission.
+    func prompt(sessionID: String, text: String, requestID: String) async throws {
         let _: PromptAcceptance = try await send(
             "POST",
             "/api/session/\(escaped(sessionID))/prompt",
-            body: ["text": text, "clientTimeZone": TimeZone.current.identifier],
+            body: [
+                "text": text,
+                "clientTimeZone": TimeZone.current.identifier,
+                "requestId": requestID,
+            ],
             session: Self.session
         )
     }
