@@ -80,8 +80,14 @@ struct DeviceSelf: Decodable, Equatable {
 
 /// Payload of `GET /api/devices`.
 struct DeviceListPayload: Decodable {
-    let self: DeviceSelf
+    /// This computer's own identity. Named `host` because `self` is reserved.
+    let host: DeviceSelf
     let devices: [PairedDeviceRecord]
+
+    enum CodingKeys: String, CodingKey {
+        case host = "self"
+        case devices
+    }
 }
 
 /// One device the computer remembers.
