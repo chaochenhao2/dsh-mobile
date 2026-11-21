@@ -67,12 +67,15 @@ struct BridgeInfo: Decodable, Equatable {
     let profile: Profile
     let host: Host
     let protocolName: String
+    /// This computer's stable identity, absent on bridges that predate pairing.
+    let device: DeviceSelf?
 
     enum CodingKeys: String, CodingKey {
         case bridge
         case dsh
         case profile
         case host
+        case device
         case protocolName = "protocol"
     }
 }
@@ -309,7 +312,7 @@ struct PromptAcceptance: Decodable {
 // MARK: - Endpoint
 
 /// Where the phone dials the bridge, and with which pairing token.
-struct Endpoint: Codable, Equatable {
+struct Endpoint: Codable, Equatable, Sendable {
     var host: String = ""
     var port: Int = 5180
     var token: String = ""

@@ -300,6 +300,47 @@ struct BridgeAPI {
         )
     }
 
+    /// Read the Session rows without wrapping them in the list payload.
+    ///
+    /// The merged multi-device list wants just the rows, and the probing path
+    /// has no use for the envelope.
+    /// @returns every Session on this device.
+    func sessionRows() async throws -> [SessionRow] {
+        let payload: SessionList = try await send("GET", "/api/sessions", body: nil, session: Self.session)
+        return payload.items
+    }
+
+    /// Tell this computer about the phone that just paired with it.
+    ///
+    /// Pairing is symmetric: without this the phone would appear in its own list
+    /// but not on the computer's.
+    /// @param deviceId - the phone's identity.
+    /// @param name - the phone's display name.
+    /// @param platform - the phone's platform label.
+    /// @param address - the phone's address, when it has one to offer.
+    func registerDevice(deviceId: String, name: String, platform: String, address: String?) async throws {
+        var body: [String: Any] = ["deviceId": deviceId, "name": name, "platform": platform]
+        if let address, !address.isEmpty { body["address"] = address }
+        let _: DeviceListPayload = try await send("POST", "/api/devices", body: body, session: Self.session)
+    }
+
+    /// Read this computer's own identity and its paired devices.
+    func deviceList() async throws -> DeviceListPayload {
+        try await send("GET", "/api/devices", body: nil, session: Self.session)
+    }
+
+    /// Ask this computer to forget a paired device.
+    /// @param deviceId - the device identity to remove.
+    func forgetDevice(deviceId: String) async throws {
+        let encoded = deviceId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? deviceId
+        let _: DeviceListPayload = try await send(
+            "POST",
+            "/api/devices/\(encoded)/forget",
+            body: [:],
+            session: Self.session
+        )
+    }
+
     /// List one directory level inside a Session's workspace.
     ///
     /// `path` is optional; omitting it lists the Session's own root, which is

@@ -162,6 +162,11 @@ function resolveSettings(rowConfig) {
     discoveryPort: pickPort([config.discoveryPort, stored.discoveryPort], DEFAULT_DISCOVERY_PORT),
     includeTokenInBeacon: pickBoolean([config.includeTokenInBeacon, stored.includeTokenInBeacon], false),
     token: nextToken,
+    // Identity and pairing survive restarts, so they are carried through rather
+    // than rebuilt on every launch.
+    ...(typeof stored.deviceId === 'string' && stored.deviceId !== '' ? { deviceId: stored.deviceId } : {}),
+    ...(typeof stored.deviceName === 'string' && stored.deviceName !== '' ? { deviceName: stored.deviceName } : {}),
+    ...(Array.isArray(stored.pairedDevices) ? { pairedDevices: stored.pairedDevices } : {}),
   }
   const changed = persistedToken === undefined
     || stored.port !== settings.port
@@ -783,8 +788,66 @@ function startStateWatcher(ctx, sessionId, abort, write, initial) {
 }
 
 // ---------------------------------------------------------------------------
-// Workspace files
+// Device identity and pairing
 // ---------------------------------------------------------------------------
+
+/**
+ * Read this machine's stable device identity.
+ *
+ * The id is generated once and persisted next to the bridge settings, so a phone
+ * that paired with this computer keeps recognizing it across restarts and DHCP
+ * changes. It is not a secret and is safe to show in a device list.
+ * @param settings - bridge settings object.
+ * @returns the identity record.
+ */
+function deviceIdentity(settings) {
+  if (settings.deviceId === undefined || settings.deviceId === '') {
+    // Derived rather than random only when a settings file already exists; a
+    // random id keeps two installs from ever colliding.
+    settings.deviceId = randomUUID()
+    try {
+      writeFileSync(settings.path, JSON.stringify(settings, null, 2), 'utf8')
+    } catch (error) {
+      // A read-only settings file still yields a usable in-process identity.
+    }
+  }
+  return {
+    deviceId: settings.deviceId,
+    name: settings.deviceName ?? hostname(),
+    platform: platform(),
+  }
+}
+
+/**
+ * Read the devices that have paired with this computer.
+ *
+ * Kept beside the settings rather than in memory: a phone that paired last week
+ * should still appear in the list after a restart, with its last-seen time
+ * explaining why it shows as offline.
+ * @param settings - bridge settings object.
+ * @returns the paired device records.
+ */
+function pairedDevices(settings) {
+  return Array.isArray(settings.pairedDevices) ? settings.pairedDevices : []
+}
+
+/**
+ * Persist one paired device, replacing any record with the same id.
+ * @param settings - bridge settings object.
+ * @param record - the device to remember.
+ * @returns the updated list.
+ */
+function rememberDevice(settings, record) {
+  const existing = pairedDevices(settings).filter((entry) => entry.deviceId !== record.deviceId)
+  const merged = [...existing, record]
+  settings.pairedDevices = merged
+  try {
+    writeFileSync(settings.path, JSON.stringify(settings, null, 2), 'utf8')
+  } catch (error) {
+    // The pairing still works for this session even if it cannot be persisted.
+  }
+  return merged
+}
 
 /**
  * Resolve the directory a Session's files are browsed from.
@@ -1651,7 +1714,52 @@ async function handleRequest(ctx, settings, req, res) {
       return
     }
     if (segments[1] === 'info' && segments.length === 2) {
-      sendJson(res, 200, await infoPayload(ctx, settings))
+      const payload = await infoPayload(ctx, settings)
+      // The identity travels with every info read, so a phone can learn which
+      // computer it just reached and detect a changed address for a known one.
+      sendJson(res, 200, { ...payload, device: deviceIdentity(settings) })
+      return
+    }
+    if (segments[1] === 'devices' && segments.length === 2 && req.method === 'GET') {
+      const self = deviceIdentity(settings)
+      sendJson(res, 200, {
+        self,
+        devices: pairedDevices(settings),
+      })
+      return
+    }
+    if (segments[1] === 'devices' && segments.length === 2 && req.method === 'POST') {
+      const body = await readJsonBody(req)
+      const deviceId = typeof body.deviceId === 'string' ? body.deviceId.trim() : ''
+      if (deviceId === '') {
+        sendJson(res, 400, { error: 'bad-request', message: '`deviceId` is required.' })
+        return
+      }
+      const name = typeof body.name === 'string' && body.name.trim() !== ''
+        ? body.name.trim()
+        : '未命名设备'
+      // Recording a pairing on this side is what makes the device show up in
+      // the computer's list; the phone does the same for this machine.
+      const devices = rememberDevice(settings, {
+        deviceId,
+        name,
+        platform: typeof body.platform === 'string' ? body.platform : 'unknown',
+        address: typeof body.address === 'string' ? body.address : null,
+        pairedAt: new Date().toISOString(),
+      })
+      sendJson(res, 200, { self: deviceIdentity(settings), devices })
+      return
+    }
+    if (segments[1] === 'devices' && segments[3] === 'forget' && req.method === 'POST') {
+      const target = decodeURIComponent(segments[2] ?? '')
+      settings.pairedDevices = pairedDevices(settings).filter((entry) => entry.deviceId !== target)
+      try {
+        writeFileSync(settings.path, JSON.stringify(settings, null, 2), 'utf8')
+      } catch (error) {
+        sendJson(res, 500, { error: 'devices/persist-failed', message: String(error?.message ?? error) })
+        return
+      }
+      sendJson(res, 200, { self: deviceIdentity(settings), devices: settings.pairedDevices })
       return
     }
     if (segments[1] === 'models' && segments.length === 2) {
@@ -2102,6 +2210,9 @@ function startBeacon(settings) {
       port: settings.port,
       dsh: dshVersion(),
       bridge: BRIDGE_VERSION,
+      // The identity lets a phone match a beacon to a device it already paired
+      // with, even after DHCP handed it a new address.
+      deviceId: deviceIdentity(settings).deviceId,
       ...(settings.includeTokenInBeacon ? { token: settings.token } : {}),
     }), 'utf8')
     const targets = new Set(['255.255.255.255'])

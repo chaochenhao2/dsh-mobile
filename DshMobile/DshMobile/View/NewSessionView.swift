@@ -6,7 +6,7 @@ struct NewSessionView: View {
     @Environment(\.dismiss) private var dismiss
 
     /// Called with the new Session identity so the caller can navigate to it.
-    let onCreate: (String) -> Void
+    let onCreate: (_ deviceID: String, _ sessionID: String) -> Void
 
     @State private var workspaces: [WorkspaceRow] = []
     @State private var modes: [AgentMode] = []
@@ -19,6 +19,8 @@ struct NewSessionView: View {
     @State private var useCustomPath = false
     @State private var customPath = ""
     @State private var selectedModeID: String?
+    /// Device the Session will be created on; nil means the primary one.
+    @State private var selectedDevice: Device?
 
     var body: some View {
         NavigationStack {
@@ -54,6 +56,7 @@ struct NewSessionView: View {
                 if let error {
                     ErrorBanner(message: error)
                 }
+                deviceSection
                 modeSection
                 workspaceSection
                 pathSection
@@ -62,6 +65,55 @@ struct NewSessionView: View {
             .padding(.bottom, 24)
         }
         .scrollDismissesKeyboard(.interactively)
+    }
+
+    // MARK: - Device
+
+    /// Only shown when there is a choice to make: with one device reachable the
+    /// picker would be noise.
+    @ViewBuilder
+    private var deviceSection: some View {
+        let online = store.registry.onlineDevices
+        if online.count > 1 {
+            VStack(alignment: .leading, spacing: 8) {
+                SectionLabel(text: "在哪台电脑上创建")
+                ForEach(online) { device in
+                    Button {
+                        selectedDevice = device
+                    } label: {
+                        HStack(spacing: 10) {
+                            Image(systemName: (selectedDevice ?? store.primaryDevice)?.id == device.id
+                                  ? "largecircle.fill.circle" : "circle")
+                                .foregroundStyle((selectedDevice ?? store.primaryDevice)?.id == device.id
+                                                 ? Theme.accent : Theme.textTertiary)
+                                .font(.system(size: 15))
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(device.name)
+                                    .font(.system(size: 14, weight: .medium))
+                                    .foregroundStyle(Theme.textPrimary)
+                                Text(device.displayAddress)
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundStyle(Theme.textTertiary)
+                            }
+                            Spacer(minLength: 0)
+                        }
+                        .padding(12)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .background(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill((selectedDevice ?? store.primaryDevice)?.id == device.id
+                                  ? Theme.surfaceRaised : Theme.surface)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .strokeBorder((selectedDevice ?? store.primaryDevice)?.id == device.id
+                                          ? Theme.accent.opacity(0.5) : Theme.border, lineWidth: 1)
+                    )
+                }
+            }
+        }
     }
 
     // MARK: - Mode
@@ -224,10 +276,11 @@ struct NewSessionView: View {
     private func load() async {
         isLoading = true
         defer { isLoading = false }
-        guard let api = store.api else {
-            error = "尚未连接。"
+        guard let device = selectedDevice ?? store.primaryDevice else {
+            error = "没有在线设备。"
             return
         }
+        let api = BridgeAPI(endpoint: device.endpoint)
         async let workspacesTask = api.workspaces()
         async let modesTask = api.modes()
         do {
@@ -245,21 +298,21 @@ struct NewSessionView: View {
     }
 
     private func create() {
-        guard let api = store.api else { return }
+        guard let device = selectedDevice ?? store.primaryDevice else { return }
         isCreating = true
         error = nil
         Task {
             defer { isCreating = false }
             do {
                 let typed = useCustomPath ? customPath : nil
-                let sessionID = try await api.createSession(
+                let sessionID = try await store.createSession(
+                    on: device,
                     workspaceID: useCustomPath ? nil : selectedWorkspaceID,
                     cwd: typed,
                     agentPreset: selectedModeID
                 )
-                await store.refreshSessions()
                 dismiss()
-                onCreate(sessionID)
+                onCreate(device.id, sessionID)
             } catch {
                 self.error = error.localizedDescription
             }

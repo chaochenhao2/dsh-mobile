@@ -1,10 +1,13 @@
 import SwiftUI
 
-/// What this phone is paired with, and the way out.
+/// Device status, plus the way to add or forget a computer.
+///
+/// The old screen described one live connection; this one describes the set of
+/// paired devices, because there may be several and none of them is "the"
+/// connection any more.
 struct SettingsView: View {
     @EnvironmentObject private var store: AppStore
     @Environment(\.dismiss) private var dismiss
-    @State private var isSwitching = false
 
     var body: some View {
         NavigationStack {
@@ -12,165 +15,97 @@ struct SettingsView: View {
                 Theme.background.ignoresSafeArea()
                 ScrollView {
                     VStack(alignment: .leading, spacing: 18) {
-                        if let info = store.info {
-                            hostCard(info)
-                            routeCard(info)
-                            capabilityCard(info)
-                        } else {
-                            Card {
-                                Text("尚未连接到电脑。")
-                                    .font(.system(size: 14))
-                                    .foregroundStyle(Theme.textSecondary)
-                            }
-                        }
+                        statusCard
+                        deviceListCard
                         Button {
-                            store.disconnect()
                             dismiss()
                         } label: {
-                            Text("断开连接")
+                            Text("关闭")
                                 .font(.system(size: 15, weight: .semibold))
-                                .foregroundStyle(Theme.danger)
+                                .foregroundStyle(Theme.accent)
                                 .frame(maxWidth: .infinity)
                                 .padding(.vertical, 14)
-                                .background(Theme.danger.opacity(0.12), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                                .background(Theme.surfaceRaised, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
                         }
                     }
                     .padding(16)
                 }
             }
-            .navigationTitle("同步")
+            .navigationTitle("设置")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("完成") { dismiss() }
                 }
             }
+            .task {
+                await store.refreshSessions()
+            }
         }
     }
 
-    private func hostCard(_ info: BridgeInfo) -> some View {
+    private var statusCard: some View {
         Card {
             VStack(alignment: .leading, spacing: 12) {
-                SectionLabel(text: "电脑")
-                heading(info.host.hostname, subtitle: "\(info.host.platform) · \(store.endpoint.displayAddress)")
+                SectionLabel(text: "状态")
+                HStack(spacing: 8) {
+                    StatusDot(color: store.hasAnyOnlineDevice ? Theme.success : Theme.warning)
+                    Text(store.statusSummary)
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(Theme.textPrimary)
+                }
                 Divider().overlay(Theme.border)
-                keyValue("Harness", info.dsh.version ?? "未知")
-                keyValue("Electron", info.dsh.electron ?? "—")
-                keyValue("桥接", info.bridge.version)
-                if let profile = info.profile.name {
-                    keyValue("Profile", profile)
-                }
-                if let web = info.host.webUrl {
-                    keyValue("Web GUI", web)
-                }
+                keyValue("本机名称", DeviceRegistry.phoneName)
+                keyValue("已配对", "\(store.registry.devices.count) 台")
+                keyValue("在线", "\(store.registry.onlineDevices.count) 台")
             }
         }
     }
 
-    /// Every network this computer is reachable on, with a one-tap switch.
-    ///
-    /// A phone that moves between home Wi-Fi and a tailnet needs this: the
-    /// address that worked on the sofa stops working on cellular, and the
-    /// person should not have to retype anything.
-    private func routeCard(_ info: BridgeInfo) -> some View {
+    private var deviceListCard: some View {
         Card {
             VStack(alignment: .leading, spacing: 10) {
-                SectionLabel(text: "可用网络")
-                ForEach(info.host.orderedCandidates, id: \.address) { candidate in
-                    let isCurrent = candidate.address == store.endpoint.host
-                    Button {
-                        guard !isCurrent else { return }
-                        isSwitching = true
-                        Task {
-                            await store.reconnect(host: candidate.address)
-                            isSwitching = false
-                        }
-                    } label: {
-                        HStack(spacing: 10) {
-                            Image(systemName: isCurrent ? "checkmark.circle.fill" : "circle")
-                                .foregroundStyle(isCurrent ? Theme.success : Theme.textTertiary)
+                SectionLabel(text: "设备")
+                if store.registry.devices.isEmpty {
+                    Text("还没有配对任何电脑。")
+                        .font(.system(size: 13))
+                        .foregroundStyle(Theme.textTertiary)
+                } else {
+                    ForEach(store.registry.devices) { device in
+                        HStack(spacing: 8) {
+                            Circle()
+                                .fill(device.isOnline ? Theme.success : Theme.textTertiary.opacity(0.4))
+                                .frame(width: 7, height: 7)
+                            Text(device.name)
                                 .font(.system(size: 13))
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(candidate.label)
-                                    .font(.system(size: 13, weight: .medium))
-                                    .foregroundStyle(Theme.textPrimary)
-                                Text(candidate.address)
-                                    .font(.system(size: 11, design: .monospaced))
-                                    .foregroundStyle(Theme.textTertiary)
-                            }
+                                .foregroundStyle(Theme.textPrimary)
+                                .lineLimit(1)
                             Spacer(minLength: 0)
-                            if isCurrent {
-                                Text("当前")
-                                    .font(.system(size: 10, design: .rounded))
-                                    .foregroundStyle(Theme.success)
-                            }
+                            Text(device.platformLabel)
+                                .font(.system(size: 10))
+                                .foregroundStyle(Theme.textTertiary)
                         }
-                        .padding(.vertical, 4)
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(isSwitching || isCurrent)
-                }
-                if isSwitching {
-                    HStack(spacing: 6) {
-                        ProgressView()
-                        Text("切换中…")
-                            .font(.system(size: 11))
-                            .foregroundStyle(Theme.textTertiary)
                     }
                 }
+                Text("在会话页的设备列表里新增或移除设备。")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Theme.textTertiary)
+                    .padding(.top, 2)
             }
-        }
-    }
-
-    private func capabilityCard(_ info: BridgeInfo) -> some View {
-        Card {
-            VStack(alignment: .leading, spacing: 10) {
-                SectionLabel(text: "能力")
-                FlowText(items: info.bridge.capabilities)
-            }
-        }
-    }
-
-    private func heading(_ title: String, subtitle: String) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Text(title)
-                .font(.system(size: 17, weight: .semibold))
-                .foregroundStyle(Theme.textPrimary)
-            Text(subtitle)
-                .font(.system(size: 12, design: .monospaced))
-                .foregroundStyle(Theme.textTertiary)
         }
     }
 
     private func keyValue(_ key: String, _ value: String) -> some View {
-        HStack(alignment: .top, spacing: 12) {
+        HStack {
             Text(key)
                 .font(.system(size: 12))
                 .foregroundStyle(Theme.textTertiary)
-                .frame(width: 70, alignment: .leading)
+            Spacer(minLength: 8)
             Text(value)
                 .font(.system(size: 12, design: .monospaced))
                 .foregroundStyle(Theme.textSecondary)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .textSelection(.enabled)
-        }
-    }
-}
-
-/// A wrapped list of small tags.
-struct FlowText: View {
-    let items: [String]
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            ForEach(items, id: \.self) { item in
-                Text(item)
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundStyle(Theme.textSecondary)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(Theme.surfaceRaised, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-            }
+                .lineLimit(1)
+                .truncationMode(.middle)
         }
     }
 }

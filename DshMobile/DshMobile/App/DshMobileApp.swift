@@ -14,18 +14,15 @@ struct DshMobileApp: App {
     }
 }
 
-/// Sends the person to pairing until a Harness answers, then to the Session list.
+/// Shows the Session list directly.
+///
+/// There is no gate before it any more: paired devices are probed in the
+/// background, and the list itself explains when nothing is paired or every
+/// device is unreachable. A connect screen would only repeat that.
 struct RootView: View {
     @EnvironmentObject private var store: AppStore
 
     var body: some View {
-        Group {
-            if store.isConnected {
-                SessionsView()
-            } else {
-                ConnectView()
-            }
-        }
-        .animation(.easeInOut(duration: 0.22), value: store.isConnected)
+        SessionsView()
     }
 }

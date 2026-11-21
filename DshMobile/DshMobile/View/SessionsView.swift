@@ -1,17 +1,20 @@
 import SwiftUI
 
-/// Every Session on the connected Harness, newest first.
+/// Sessions merged from every paired computer, newest first.
+///
+/// The list is no longer tied to one connection: each row carries the device it
+/// came from, and a device going offline never removes the others' rows.
 struct SessionsView: View {
     @EnvironmentObject private var store: AppStore
     @State private var showsSettings = false
     @State private var showsNewSession = false
     @State private var showsFiles = false
+    @State private var showsDevices = false
     @State private var searchWork: Task<Void, Never>?
     /// Session being renamed, and the draft title.
-    @State private var renaming: SessionRow?
+    @State private var renaming: DeviceSession?
     @State private var renameDraft = ""
-    /// Drives programmatic navigation into a freshly created Session.
-    /// iOS 16 has no `navigationDestination(item:)`, so a path is pushed instead.
+    /// Drives navigation; the value is the merged key `deviceId/sessionId`.
     @State private var path: [String] = []
 
     var body: some View {
@@ -33,6 +36,11 @@ struct SessionsView: View {
                 ToolbarItem(placement: .topBarTrailing) {
                     HStack(spacing: 14) {
                         Button {
+                            showsDevices = true
+                        } label: {
+                            Image(systemName: "desktopcomputer")
+                        }
+                        Button {
                             showsFiles = true
                         } label: {
                             Image(systemName: "tray.and.arrow.down")
@@ -42,28 +50,36 @@ struct SessionsView: View {
                         } label: {
                             Image(systemName: "square.and.pencil")
                         }
+                        .disabled(!store.hasAnyOnlineDevice)
                     }
                 }
             }
             .sheet(isPresented: $showsSettings) {
-                SettingsView()
-                    .environmentObject(store)
+                SettingsView().environmentObject(store)
             }
             .sheet(isPresented: $showsFiles) {
                 FilesView()
             }
+            .sheet(isPresented: $showsDevices) {
+                DevicesView().environmentObject(store)
+            }
             .sheet(isPresented: $showsNewSession) {
-                NewSessionView { sessionID in
-                    openCreated(sessionID)
+                NewSessionView { deviceID, sessionID in
+                    openCreated(deviceID: deviceID, sessionID: sessionID)
                 }
                 .environmentObject(store)
             }
-            .navigationDestination(for: String.self) { sessionID in
-                ChatView(
-                    sessionID: sessionID,
-                    title: store.sessions.first { $0.id == sessionID }?.title ?? "会话",
-                    endpoint: store.endpoint
-                )
+            .navigationDestination(for: String.self) { key in
+                if let target = store.sessions.first(where: { $0.id == key }) {
+                    ChatView(
+                        sessionID: target.row.id,
+                        title: target.row.title,
+                        endpoint: target.endpoint
+                    )
+                } else {
+                    Text("这台设备上的会话已不可用。")
+                        .foregroundStyle(Theme.textSecondary)
+                }
             }
             .alert("重命名会话", isPresented: Binding(
                 get: { renaming != nil },
@@ -75,14 +91,14 @@ struct SessionsView: View {
                     guard let target = renaming else { return }
                     let title = renameDraft
                     renaming = nil
-                    Task { await store.rename(sessionID: target.id, title: title) }
+                    Task {
+                        await store.rename(
+                            sessionID: target.row.id,
+                            deviceID: target.deviceId,
+                            title: title
+                        )
+                    }
                 }
-            }
-            .task {
-                await store.refreshSessions()
-            }
-            .refreshable {
-                await store.refreshSessions()
             }
             .searchable(
                 text: $store.searchQuery,
@@ -90,19 +106,24 @@ struct SessionsView: View {
                 prompt: "搜索会话内容"
             )
             // Debounced rather than per-keystroke: every character would
-            // otherwise scan every transcript on the computer.
+            // otherwise scan every transcript on every computer.
             .onChange(of: store.searchQuery) { _ in
                 scheduleSearch()
+            }
+            .task {
+                await store.refreshSessions()
+            }
+            .refreshable {
+                await store.refreshSessions()
             }
         }
     }
 
-    /// Wait for typing to settle before asking the bridge.
+    /// Wait for typing to settle before asking the devices.
     private func scheduleSearch() {
         searchWork?.cancel()
         let query = store.searchQuery
         searchWork = Task {
-            // A short pause keeps one search per burst of typing.
             try? await Task.sleep(nanoseconds: 320_000_000)
             guard !Task.isCancelled else { return }
             await store.search(query)
@@ -110,9 +131,124 @@ struct SessionsView: View {
     }
 
     /// Navigate into a freshly created Session.
-    /// @param sessionID - the identity the bridge returned.
-    private func openCreated(_ sessionID: String) {
-        path.append(sessionID)
+    /// @param deviceID - the device that owns it.
+    /// @param sessionID - the Session identity inside that device.
+    private func openCreated(deviceID: String, sessionID: String) {
+        path.append("\(deviceID)/\(sessionID)")
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        if !store.searchQuery.trimmingCharacters(in: .whitespaces).isEmpty {
+            searchResults
+        } else if !store.hasPairedDevice {
+            pairedEmptyState
+        } else if store.sessions.isEmpty && !store.hasAnyOnlineDevice {
+            allOfflineState
+        } else if store.sessions.isEmpty && store.isLoadingSessions {
+            ProgressView("读取会话…").tint(Theme.accent)
+        } else if store.sessions.isEmpty {
+            noSessionsState
+        } else {
+            sessionList
+        }
+    }
+
+    private var sessionList: some View {
+        ScrollView {
+            LazyVStack(spacing: 10) {
+                header
+                if let error = store.lastError {
+                    ErrorBanner(message: error)
+                }
+                ForEach(store.sessions) { entry in
+                    NavigationLink(value: entry.id) {
+                        row(entry)
+                    }
+                    .buttonStyle(.plain)
+                    .contextMenu {
+                        Button {
+                            renaming = entry
+                            renameDraft = entry.row.title
+                        } label: {
+                            Label("重命名", systemImage: "pencil")
+                        }
+                    }
+                }
+            }
+            .padding(16)
+            .padding(.bottom, 24)
+        }
+    }
+
+    /// Shown when nothing is paired yet: pairing is the only prerequisite.
+    private var pairedEmptyState: some View {
+        VStack(spacing: 14) {
+            Image(systemName: "desktopcomputer")
+                .font(.system(size: 40, weight: .light))
+                .foregroundStyle(Theme.textTertiary)
+            Text("还没有配对的电脑")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(Theme.textSecondary)
+            Text("配对一次即可，之后打开 App 会自动连接。")
+                .font(.system(size: 13))
+                .foregroundStyle(Theme.textTertiary)
+            Button("配对电脑") { showsDevices = true }
+                .buttonStyle(PrimaryButtonStyle())
+                .frame(maxWidth: 220)
+                .padding(.top, 8)
+        }
+        .padding(32)
+    }
+
+    /// Shown when every paired device is unreachable.
+    ///
+    /// The list stays empty rather than showing stale rows, and the reason per
+    /// device is one tap away.
+    private var allOfflineState: some View {
+        VStack(spacing: 14) {
+            Image(systemName: "wifi.exclamationmark")
+                .font(.system(size: 40, weight: .light))
+                .foregroundStyle(Theme.warning.opacity(0.8))
+            Text("所有设备都离线")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(Theme.textSecondary)
+            Text("检查电脑上的 DSH 是否在运行，以及手机与电脑是否在同一网络。")
+                .font(.system(size: 12))
+                .foregroundStyle(Theme.textTertiary)
+                .multilineTextAlignment(.center)
+            HStack(spacing: 10) {
+                Button("重试") { Task { await store.refreshSessions() } }
+                    .buttonStyle(PrimaryButtonStyle())
+                Button("设备列表") { showsDevices = true }
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(Theme.accent)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                    .background(Theme.surfaceRaised, in: Capsule())
+            }
+            .padding(.top, 8)
+        }
+        .padding(32)
+    }
+
+    private var noSessionsState: some View {
+        VStack(spacing: 14) {
+            Image(systemName: "rectangle.stack.badge.plus")
+                .font(.system(size: 40, weight: .light))
+                .foregroundStyle(Theme.textTertiary)
+            Text("还没有会话")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(Theme.textSecondary)
+            Text("点右上角新建一个，或先在电脑上开始对话。")
+                .font(.system(size: 13))
+                .foregroundStyle(Theme.textTertiary)
+            Button("新建会话") { showsNewSession = true }
+                .buttonStyle(PrimaryButtonStyle())
+                .frame(maxWidth: 220)
+                .padding(.top, 8)
+        }
+        .padding(32)
     }
 
     /// Results of the active search, with the matching excerpt per row.
@@ -141,8 +277,6 @@ struct SessionsView: View {
                             .foregroundStyle(Theme.textTertiary)
                         Spacer()
                         if !store.searchIsTranscript {
-                            // Say so rather than letting a title-only match look
-                            // like a full search that found nothing else.
                             Text("仅匹配标题")
                                 .font(.system(size: 10))
                                 .foregroundStyle(Theme.warning.opacity(0.9))
@@ -152,10 +286,12 @@ struct SessionsView: View {
                         }
                     }
                     ForEach(store.hits) { hit in
-                        NavigationLink(value: hit.id) {
-                            hitRow(hit)
+                        if let deviceID = hit.deviceId, let raw = hit.id.split(separator: "/").last {
+                            NavigationLink(value: "\(deviceID)/\(raw)") {
+                                hitRow(hit)
+                            }
+                            .buttonStyle(.plain)
                         }
-                        .buttonStyle(.plain)
                     }
                 }
                 .padding(16)
@@ -172,11 +308,17 @@ struct SessionsView: View {
                     .foregroundStyle(Theme.textPrimary)
                     .lineLimit(1)
                 if hit.running {
-                    Circle()
-                        .fill(Theme.accent)
-                        .frame(width: 6, height: 6)
+                    Circle().fill(Theme.accent).frame(width: 6, height: 6)
                 }
                 Spacer(minLength: 0)
+                if let deviceName = hit.deviceName {
+                    Text(deviceName)
+                        .font(.system(size: 9))
+                        .foregroundStyle(Theme.textTertiary)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(Theme.surfaceRaised, in: Capsule())
+                }
             }
             if let preview = hit.previewText {
                 Text(preview)
@@ -195,123 +337,62 @@ struct SessionsView: View {
         )
     }
 
-    /// The ordinary list, or the empty state before anything exists.
-    @ViewBuilder
-    private var content: some View {
-        if !store.searchQuery.trimmingCharacters(in: .whitespaces).isEmpty {
-            searchResults
-        } else if store.sessions.isEmpty {
-            emptyState
-        } else {
-            ScrollView {
-                LazyVStack(spacing: 10) {
-                    header
-                    if let error = store.lastError {
-                        ErrorBanner(message: error)
-                    }
-                    ForEach(store.sessions) { session in
-                        NavigationLink(value: session.id) {
-                            row(session)
-                        }
-                        .buttonStyle(.plain)
-                        .contextMenu {
-                            Button {
-                                renaming = session
-                                renameDraft = session.title
-                            } label: {
-                                Label("重命名", systemImage: "pencil")
-                            }
-                        }
-                    }
-                }
-                .padding(16)
-                .padding(.bottom, 24)
-            }
-        }
-    }
-
     private var header: some View {
         HStack(spacing: 10) {
-            StatusDot(color: store.isRetrying ? Theme.warning : Theme.success)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(store.hostSummary)
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(Theme.textPrimary)
-                Text(store.isRetrying ? "网络不稳定，正在重试…" : "\(store.sessions.count) 个会话")
-                    .font(.system(size: 12))
-                    .foregroundStyle(store.isRetrying ? Theme.warning : Theme.textTertiary)
-            }
+            StatusDot(color: store.isRetrying ? Theme.warning : (store.hasAnyOnlineDevice ? Theme.success : Theme.textTertiary))
+            Text(store.statusSummary)
+                .font(.system(size: 12))
+                .foregroundStyle(Theme.textTertiary)
             Spacer()
             if store.isLoadingSessions {
-                ProgressView()
+                ProgressView().tint(Theme.accent).scaleEffect(0.7)
             }
         }
-        .padding(.vertical, 4)
+        .padding(.bottom, 4)
     }
 
-    private func row(_ session: SessionRow) -> some View {
-        HStack(alignment: .top, spacing: 12) {
-            Circle()
-                .fill(session.running ? Theme.success : Theme.textTertiary.opacity(0.4))
-                .frame(width: 8, height: 8)
-                .padding(.top, 6)
-            VStack(alignment: .leading, spacing: 5) {
-                Text(session.title)
-                    .font(.system(size: 15, weight: .semibold))
+    private func row(_ entry: DeviceSession) -> some View {
+        HStack(spacing: 12) {
+            StatusDot(color: entry.row.running ? Theme.accent : Theme.textTertiary.opacity(0.5))
+            VStack(alignment: .leading, spacing: 3) {
+                Text(entry.row.title)
+                    .font(.system(size: 15, weight: .medium))
                     .foregroundStyle(Theme.textPrimary)
                     .lineLimit(2)
                     .multilineTextAlignment(.leading)
                 HStack(spacing: 8) {
-                    Text(session.ageText)
-                    if let cwd = session.cwd, !cwd.isEmpty {
-                        Text(shortPath(cwd))
-                            .lineLimit(1)
-                    }
-                    if session.origin == "subagent" {
-                        Text("子代理")
+                    Text(entry.deviceName)
+                        .font(.system(size: 10))
+                        .foregroundStyle(Theme.accentAlt.opacity(0.9))
+                    if let updated = entry.row.updatedAt {
+                        Text(Self.relative(updated))
+                            .font(.system(size: 10))
+                            .foregroundStyle(Theme.textTertiary)
                     }
                 }
-                .font(.system(size: 11, design: .monospaced))
-                .foregroundStyle(Theme.textTertiary)
             }
             Spacer(minLength: 0)
             Image(systemName: "chevron.right")
                 .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(Theme.textTertiary)
-                .padding(.top, 4)
+                .foregroundStyle(Theme.textTertiary.opacity(0.6))
         }
         .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(Theme.surface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .strokeBorder(session.running ? Theme.success.opacity(0.35) : Theme.border, lineWidth: 1)
+                .strokeBorder(entry.row.running ? Theme.accent.opacity(0.35) : Theme.border, lineWidth: 1)
         )
     }
 
-    private var emptyState: some View {
-        VStack(spacing: 14) {
-            Image(systemName: "rectangle.stack.badge.plus")
-                .font(.system(size: 40, weight: .light))
-                .foregroundStyle(Theme.textTertiary)
-            Text("还没有会话")
-                .font(.system(size: 16, weight: .semibold))
-                .foregroundStyle(Theme.textSecondary)
-            Text("点右上角新建一个，或先在电脑上开始对话。")
-                .font(.system(size: 13))
-                .foregroundStyle(Theme.textTertiary)
-            Button("新建会话") { showsNewSession = true }
-                .buttonStyle(PrimaryButtonStyle())
-                .frame(maxWidth: 220)
-                .padding(.top, 8)
-        }
-        .padding(32)
-    }
-
-    // MARK: - Actions
-
-    private func shortPath(_ path: String) -> String {
-        let components = path.split(separator: "/")
-        guard components.count > 2 else { return path }
-        return components.suffix(2).joined(separator: "/")
+    /// Format an epoch-seconds timestamp as a short relative age.
+    /// @param timestamp - seconds since 1970.
+    /// @returns a relative label.
+    private static func relative(_ timestamp: Double) -> String {
+        let date = Date(timeIntervalSince1970: timestamp > 1e12 ? timestamp / 1000 : timestamp)
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .short
+        return formatter.localizedString(for: date, relativeTo: Date())
     }
 }
+

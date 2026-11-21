@@ -7,6 +7,49 @@ struct SessionHit: Decodable, Identifiable, Equatable {
     let running: Bool
     /// The matching excerpt, present when the match came from a message body.
     let snippet: String?
+    /// The device this hit came from, filled in when results are merged.
+    var deviceId: String?
+    var deviceName: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case title
+        case running
+        case snippet
+        case deviceId
+        case deviceName
+    }
+
+    init(
+        id: String,
+        title: String,
+        running: Bool,
+        snippet: String?,
+        deviceId: String? = nil,
+        deviceName: String? = nil
+    ) {
+        self.id = id
+        self.title = title
+        self.running = running
+        self.snippet = snippet
+        self.deviceId = deviceId
+        self.deviceName = deviceName
+    }
+
+    /// Decode a hit from the bridge.
+    ///
+    /// Written out because the memberwise initializer above suppresses the
+    /// synthesised one; the origin fields are absent on the wire and default to
+    /// nil until results are merged.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        title = try container.decode(String.self, forKey: .title)
+        running = (try? container.decode(Bool.self, forKey: .running)) ?? false
+        snippet = try? container.decode(String.self, forKey: .snippet)
+        deviceId = nil
+        deviceName = nil
+    }
 
     /// The excerpt flattened to one line, since a row can only show one.
     var previewText: String? {
