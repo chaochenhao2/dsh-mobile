@@ -36,11 +36,6 @@ private struct RenameResult: Decodable {
     let title: String?
 }
 
-/// Reply to a cancel request.
-private struct CancelResult: Decodable {
-    let accepted: Bool?
-}
-
 struct BridgeAPI {
     let endpoint: Endpoint
 
@@ -301,17 +296,6 @@ struct BridgeAPI {
             "POST",
             "/api/session/\(escaped(sessionID))/rename",
             body: ["title": title],
-            session: Self.session
-        )
-    }
-
-    /// Stop the turn that is currently running.
-    /// @param sessionID - Session whose turn should stop.
-    func cancel(sessionID: String) async throws {
-        let _: CancelResult = try await send(
-            "POST",
-            "/api/session/\(escaped(sessionID))/cancel",
-            body: [:],
             session: Self.session
         )
     }
