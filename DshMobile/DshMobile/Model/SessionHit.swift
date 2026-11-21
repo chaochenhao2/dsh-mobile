@@ -25,4 +25,10 @@ struct SessionHit: Decodable, Identifiable, Equatable {
 struct SearchPayload: Decodable {
     let items: [SessionHit]
     let hasMore: Bool
+    /// How the match was made: the Harness's transcript index, or a title match
+    /// when that index is disabled on this deployment.
+    let mode: String?
+
+    /// Whether results cover message bodies rather than only titles.
+    var isTranscriptSearch: Bool { mode == "transcript" }
 }

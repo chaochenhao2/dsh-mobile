@@ -1681,34 +1681,53 @@ async function handleRequest(ctx, settings, req, res) {
     if (segments[1] === 'search' && segments.length === 2 && req.method === 'GET') {
       const query = url.searchParams.get('q') ?? ''
       if (query.trim() === '') {
-        sendJson(res, 200, { items: [], hasMore: false })
+        sendJson(res, 200, { items: [], hasMore: false, mode: 'empty' })
         return
       }
       const signal = new AbortController().signal
-      const found = await controller.search({ query }, signal)
-      // Titles come from the list so a hit row looks like every other row; the
-      // snippet is what explains why it matched.
-      const titles = new Map()
+      const list = await controller.list({}, signal)
+      const rows = list.items ?? []
+      const needle = query.toLowerCase()
       try {
-        const list = await controller.list({}, signal)
-        for (const row of list.items ?? []) titles.set(row.sessionId, row)
-      } catch {
-        // A missing title is tolerable; the hit still has its snippet.
+        // The Harness's own transcript index is the better search when the
+        // deployment enabled it, so try it first.
+        const found = await controller.search({ query }, signal)
+        const titles = new Map(rows.map((row) => [row.sessionId, row]))
+        sendJson(res, 200, {
+          mode: 'transcript',
+          hasMore: found.hasMore === true,
+          items: (found.items ?? []).map((item) => {
+            const row = titles.get(item.sessionId)
+            return {
+              id: item.sessionId,
+              title: typeof row?.projections?.values?.title === 'string'
+                ? row.projections.values.title
+                : 'Session',
+              running: row?.running === true,
+              snippet: typeof item.snippet === 'string' ? item.snippet : null,
+            }
+          }),
+        })
+        return
+      } catch (error) {
+        // transcript index disabled. Many deployments configure it with
+        // `openAt: "never"`, which is a supported configuration, so fall back to
+        // filtering titles rather than failing the search outright.
+        ctx.logger.info(`dsh-mobile-bridge: transcript search unavailable, filtering titles: ${error?.message ?? error}`)
       }
-      sendJson(res, 200, {
-        hasMore: found.hasMore === true,
-        items: (found.items ?? []).map((item) => {
-          const row = titles.get(item.sessionId)
-          return {
-            id: item.sessionId,
-            title: typeof row?.projections?.values?.title === 'string'
-              ? row.projections.values.title
-              : 'Session',
-            running: row?.running === true,
-            snippet: typeof item.snippet === 'string' ? item.snippet : null,
-          }
-        }),
-      })
+      const matches = []
+      for (const row of rows) {
+        const title = row?.projections?.values?.title
+        if (typeof title === 'string' && title.toLowerCase().includes(needle)) {
+          matches.push({
+            id: row.sessionId,
+            title,
+            running: row.running === true,
+            snippet: null,
+          })
+        }
+      }
+      sendJson(res, 200, { mode: 'title', hasMore: false, items: matches })
       return
     }
     if (segments[1] === 'sessions') {

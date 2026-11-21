@@ -140,6 +140,16 @@ struct SessionsView: View {
                             .font(.system(size: 12))
                             .foregroundStyle(Theme.textTertiary)
                         Spacer()
+                        if !store.searchIsTranscript {
+                            // Say so rather than letting a title-only match look
+                            // like a full search that found nothing else.
+                            Text("仅匹配标题")
+                                .font(.system(size: 10))
+                                .foregroundStyle(Theme.warning.opacity(0.9))
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 3)
+                                .background(Theme.warning.opacity(0.12), in: Capsule())
+                        }
                     }
                     ForEach(store.hits) { hit in
                         NavigationLink(value: hit.id) {

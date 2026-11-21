@@ -22,6 +22,9 @@ final class AppStore: ObservableObject {
     @Published var searchQuery: String = ""
     /// Results of the active search.
     @Published private(set) var hits: [SessionHit] = []
+    /// Whether those results covered message bodies; false means title-only,
+    /// because this deployment disabled the transcript index.
+    @Published private(set) var searchIsTranscript = false
     @Published private(set) var isSearching = false
     @Published private(set) var isLoadingSessions = false
     @Published var lastError: String?
@@ -173,6 +176,7 @@ final class AppStore: ObservableObject {
             // A newer query may have started while this one was in flight.
             guard trimmed == searchQuery else { return }
             hits = payload.items
+            searchIsTranscript = payload.isTranscriptSearch
             lastError = nil
         } catch {
             if RetryPolicy.isCancellation(error) { return }
