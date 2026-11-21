@@ -433,3 +433,13 @@ struct ChatView: View {
         }
     }
 }
+
+extension String {
+    /// The value with surrounding whitespace removed.
+    ///
+    /// Used for emptiness checks on composed input, where a message of spaces
+    /// should not enable the send button.
+    var trimmed: String {
+        trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
