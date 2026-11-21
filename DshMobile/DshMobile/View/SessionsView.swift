@@ -6,6 +6,10 @@ struct SessionsView: View {
     @State private var showsSettings = false
     @State private var showsNewSession = false
     @State private var showsFiles = false
+    @State private var searchWork: Task<Void, Never>?
+    /// Session being renamed, and the draft title.
+    @State private var renaming: SessionRow?
+    @State private var renameDraft = ""
     /// Drives programmatic navigation into a freshly created Session.
     /// iOS 16 has no `navigationDestination(item:)`, so a path is pushed instead.
     @State private var path: [String] = []
@@ -61,12 +65,47 @@ struct SessionsView: View {
                     endpoint: store.endpoint
                 )
             }
+            .alert("重命名会话", isPresented: Binding(
+                get: { renaming != nil },
+                set: { if !$0 { renaming = nil } }
+            )) {
+                TextField("标题", text: $renameDraft)
+                Button("取消", role: .cancel) { renaming = nil }
+                Button("保存") {
+                    guard let target = renaming else { return }
+                    let title = renameDraft
+                    renaming = nil
+                    Task { await store.rename(sessionID: target.id, title: title) }
+                }
+            }
             .task {
                 await store.refreshSessions()
             }
             .refreshable {
                 await store.refreshSessions()
             }
+            .searchable(
+                text: $store.searchQuery,
+                placement: .navigationBarDrawer(displayMode: .always),
+                prompt: "搜索会话内容"
+            )
+            // Debounced rather than per-keystroke: every character would
+            // otherwise scan every transcript on the computer.
+            .onChange(of: store.searchQuery) { _ in
+                scheduleSearch()
+            }
+        }
+    }
+
+    /// Wait for typing to settle before asking the bridge.
+    private func scheduleSearch() {
+        searchWork?.cancel()
+        let query = store.searchQuery
+        searchWork = Task {
+            // A short pause keeps one search per burst of typing.
+            try? await Task.sleep(nanoseconds: 320_000_000)
+            guard !Task.isCancelled else { return }
+            await store.search(query)
         }
     }
 
@@ -76,9 +115,82 @@ struct SessionsView: View {
         path.append(sessionID)
     }
 
+    /// Results of the active search, with the matching excerpt per row.
+    @ViewBuilder
+    private var searchResults: some View {
+        if store.isSearching && store.hits.isEmpty {
+            ProgressView("搜索中…")
+                .tint(Theme.accent)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if store.hits.isEmpty {
+            VStack(spacing: 10) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 32, weight: .light))
+                    .foregroundStyle(Theme.textTertiary)
+                Text("没有找到包含这段文字的会话")
+                    .font(.system(size: 13))
+                    .foregroundStyle(Theme.textSecondary)
+            }
+            .padding(32)
+        } else {
+            ScrollView {
+                LazyVStack(spacing: 10) {
+                    HStack {
+                        Text("\(store.hits.count) 个结果")
+                            .font(.system(size: 12))
+                            .foregroundStyle(Theme.textTertiary)
+                        Spacer()
+                    }
+                    ForEach(store.hits) { hit in
+                        NavigationLink(value: hit.id) {
+                            hitRow(hit)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(16)
+                .padding(.bottom, 24)
+            }
+        }
+    }
+
+    private func hitRow(_ hit: SessionHit) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Text(hit.title)
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(Theme.textPrimary)
+                    .lineLimit(1)
+                if hit.running {
+                    Circle()
+                        .fill(Theme.accent)
+                        .frame(width: 6, height: 6)
+                }
+                Spacer(minLength: 0)
+            }
+            if let preview = hit.previewText {
+                Text(preview)
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.textSecondary)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(14)
+        .background(Theme.surface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(Theme.border, lineWidth: 1)
+        )
+    }
+
+    /// The ordinary list, or the empty state before anything exists.
     @ViewBuilder
     private var content: some View {
-        if store.sessions.isEmpty {
+        if !store.searchQuery.trimmingCharacters(in: .whitespaces).isEmpty {
+            searchResults
+        } else if store.sessions.isEmpty {
             emptyState
         } else {
             ScrollView {
@@ -92,6 +204,14 @@ struct SessionsView: View {
                             row(session)
                         }
                         .buttonStyle(.plain)
+                        .contextMenu {
+                            Button {
+                                renaming = session
+                                renameDraft = session.title
+                            } label: {
+                                Label("重命名", systemImage: "pencil")
+                            }
+                        }
                     }
                 }
                 .padding(16)

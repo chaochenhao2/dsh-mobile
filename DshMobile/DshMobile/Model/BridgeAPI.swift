@@ -31,6 +31,16 @@ enum BridgeError: LocalizedError {
 /// Every call authenticates with the pairing token; the bridge is the only
 /// component that knows how to reach the Harness, so this type stays a thin
 /// transport.
+/// Reply to a rename request; only the committed title matters to the app.
+private struct RenameResult: Decodable {
+    let title: String?
+}
+
+/// Reply to a cancel request.
+private struct CancelResult: Decodable {
+    let accepted: Bool?
+}
+
 struct BridgeAPI {
     let endpoint: Endpoint
 
@@ -268,6 +278,40 @@ struct BridgeAPI {
             "POST",
             "/api/session/\(escaped(sessionID))/model",
             body: body,
+            session: Self.session
+        )
+    }
+
+    /// Search every Session's transcript for a literal query.
+    /// @param query - the text to look for.
+    /// @returns matching Sessions with their excerpts.
+    func search(query: String) async throws -> SearchPayload {
+        let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? query
+        return try await send("GET", "/api/search?q=\(encoded)", body: nil, session: Self.session)
+    }
+
+    /// Rename one Session.
+    ///
+    /// The Harness commits the new title as a durable event, so it survives a
+    /// restart and shows up on the computer too.
+    /// @param sessionID - Session to rename.
+    /// @param title - the new title.
+    func rename(sessionID: String, title: String) async throws {
+        let _: RenameResult = try await send(
+            "POST",
+            "/api/session/\(escaped(sessionID))/rename",
+            body: ["title": title],
+            session: Self.session
+        )
+    }
+
+    /// Stop the turn that is currently running.
+    /// @param sessionID - Session whose turn should stop.
+    func cancel(sessionID: String) async throws {
+        let _: CancelResult = try await send(
+            "POST",
+            "/api/session/\(escaped(sessionID))/cancel",
+            body: [:],
             session: Self.session
         )
     }

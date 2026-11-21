@@ -1675,6 +1675,42 @@ async function handleRequest(ctx, settings, req, res) {
       sendJson(res, 200, catalog)
       return
     }
+    // Session search spans transcripts, so it is its own endpoint rather than a
+    // filter on the list: the Harness matches message bodies, which the list
+    // rows never carry.
+    if (segments[1] === 'search' && segments.length === 2 && req.method === 'GET') {
+      const query = url.searchParams.get('q') ?? ''
+      if (query.trim() === '') {
+        sendJson(res, 200, { items: [], hasMore: false })
+        return
+      }
+      const signal = new AbortController().signal
+      const found = await controller.search({ query }, signal)
+      // Titles come from the list so a hit row looks like every other row; the
+      // snippet is what explains why it matched.
+      const titles = new Map()
+      try {
+        const list = await controller.list({}, signal)
+        for (const row of list.items ?? []) titles.set(row.sessionId, row)
+      } catch {
+        // A missing title is tolerable; the hit still has its snippet.
+      }
+      sendJson(res, 200, {
+        hasMore: found.hasMore === true,
+        items: (found.items ?? []).map((item) => {
+          const row = titles.get(item.sessionId)
+          return {
+            id: item.sessionId,
+            title: typeof row?.projections?.values?.title === 'string'
+              ? row.projections.values.title
+              : 'Session',
+            running: row?.running === true,
+            snippet: typeof item.snippet === 'string' ? item.snippet : null,
+          }
+        }),
+      })
+      return
+    }
     if (segments[1] === 'sessions') {
       if (segments.length === 2 && req.method === 'GET') {
         const signal = new AbortController().signal
@@ -1774,6 +1810,16 @@ async function handleRequest(ctx, settings, req, res) {
       }
       if (tail === 'cancel' && req.method === 'POST') {
         sendJson(res, 200, controller.cancel({ sessionId }))
+        return
+      }
+      if (tail === 'rename' && req.method === 'POST') {
+        const body = await readJsonBody(req)
+        const title = typeof body.title === 'string' ? body.title.trim() : ''
+        if (title === '') {
+          sendJson(res, 400, { error: 'bad-request', message: '`title` is required.' })
+          return
+        }
+        sendJson(res, 200, await controller.rename({ sessionId, title }))
         return
       }
       if (tail === 'permission' && req.method === 'POST') {

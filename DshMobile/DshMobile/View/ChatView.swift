@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// One Session's conversation, followed live.
 struct ChatView: View {
@@ -198,6 +199,21 @@ struct ChatView: View {
             RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .strokeBorder(Theme.border, lineWidth: 1)
         )
+        // Long-press actions on the bubble. Selecting text already works, but
+        // taking the whole message needs a menu: quoting an assistant answer
+        // into the composer is the common follow-up on a phone.
+        .contextMenu {
+            Button {
+                UIPasteboard.general.string = node.text
+            } label: {
+                Label("复制", systemImage: "doc.on.doc")
+            }
+            Button {
+                draft = node.text
+            } label: {
+                Label("引用到输入框", systemImage: "text.bubble")
+            }
+        }
     }
 
     /// Collapsible thinking trace. It stays open while the model is still

@@ -17,6 +17,12 @@ final class AppStore: ObservableObject {
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var info: BridgeInfo?
     @Published private(set) var sessions: [SessionRow] = []
+    /// Current search text, mirrored here so an in-flight result can detect that
+    /// a newer query superseded it.
+    @Published var searchQuery: String = ""
+    /// Results of the active search.
+    @Published private(set) var hits: [SessionHit] = []
+    @Published private(set) var isSearching = false
     @Published private(set) var isLoadingSessions = false
     @Published var lastError: String?
     @Published var endpoint: Endpoint
@@ -144,6 +150,57 @@ final class AppStore: ObservableObject {
             var next = endpoint
             next.host = host
             return next
+        }
+    }
+
+    /// Search every Session's transcript.
+    ///
+    /// Results replace the list while a query is active; an empty query restores
+    /// the ordinary list rather than issuing a request the bridge would reject.
+    /// @param query - the text to look for.
+    func search(_ query: String) async {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            hits = []
+            isSearching = false
+            return
+        }
+        guard let api else { return }
+        isSearching = true
+        defer { isSearching = false }
+        do {
+            let payload = try await api.search(query: trimmed)
+            // A newer query may have started while this one was in flight.
+            guard trimmed == searchQuery else { return }
+            hits = payload.items
+            lastError = nil
+        } catch {
+            if RetryPolicy.isCancellation(error) { return }
+            lastError = Self.describe(error)
+        }
+    }
+
+    /// Rename one Session and reflect it in the list immediately.
+    /// @param sessionID - Session to rename.
+    /// @param title - the new title.
+    /// @returns whether the rename was accepted.
+    @discardableResult
+    func rename(sessionID: String, title: String) async -> Bool {
+        guard let api else { return false }
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        do {
+            try await api.rename(sessionID: sessionID, title: trimmed)
+            // Patch the row in place so the list shows the new name without a
+            // full refresh, which would also reorder it under the person.
+            if let index = sessions.firstIndex(where: { $0.id == sessionID }) {
+                sessions[index] = sessions[index].withTitle(trimmed)
+            }
+            return true
+        } catch {
+            if RetryPolicy.isCancellation(error) { return false }
+            lastError = Self.describe(error)
+            return false
         }
     }
 

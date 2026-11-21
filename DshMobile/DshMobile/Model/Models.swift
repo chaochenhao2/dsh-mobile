@@ -113,6 +113,22 @@ struct SessionRow: Decodable, Identifiable, Equatable {
         self.origin = origin
     }
 
+    /// Copy this row with a new title, leaving every other field intact.
+    /// @param title - the replacement title.
+    /// @returns a row differing only in title.
+    func withTitle(_ title: String) -> SessionRow {
+        SessionRow(
+            id: id,
+            title: title,
+            updatedAt: updatedAt,
+            running: running,
+            blank: blank,
+            cwd: cwd,
+            agentAvailable: agentAvailable,
+            origin: origin
+        )
+    }
+
     /// Relative age, for a list row subtitle.
     var ageText: String {
         guard let updatedAt else { return "—" }

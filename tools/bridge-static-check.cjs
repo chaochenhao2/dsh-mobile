@@ -49,6 +49,14 @@ for (const [id, label] of [
   check(`${id} -> ${label}`, source.includes(`${id}: '${label}'`))
 }
 
+console.log('session actions:')
+check('GET /api/search', /segments\[1\] === 'search'/.test(source))
+check('search rejects empty query', /query\.trim\(\) === ''/.test(source))
+check('search reports snippets', /snippet:/.test(source))
+check('POST /api/session/:id/rename', /tail === 'rename'/.test(source))
+check('rename requires a title', /`title` is required/.test(source))
+check('POST /api/session/:id/cancel', /controller\.cancel\(\{ sessionId \}\)/.test(source))
+
 console.log('request id:')
 check('prompt honours caller requestId', /body\.requestId/.test(source))
 check('prompt echoes requestId', /requestId \}/.test(source))
