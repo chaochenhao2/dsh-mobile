@@ -84,7 +84,13 @@ struct BridgeAPI {
         guard let url = URL(string: path, relativeTo: base) else { throw BridgeError.invalidURL }
         var request = URLRequest(url: url)
         request.httpMethod = method
-        request.setValue("Bearer \(endpoint.token.trimmingCharacters(in: .whitespaces))", forHTTPHeaderField: "Authorization")
+        // Send credentials only when there are some: a `Bearer ` header with an
+        // empty value is a malformed credential, and the default deployment
+        // wants no header at all.
+        let token = endpoint.token.trimmingCharacters(in: .whitespaces)
+        if !token.isEmpty {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         if let body {
             request.httpBody = body

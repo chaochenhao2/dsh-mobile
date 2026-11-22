@@ -1,7 +1,29 @@
 {
-  "meta": {
-    "title": "Mobile bridge",
-    "description": "Serves this Harness to the DSH Mobile iOS app over your local network: list Sessions, follow a transcript live, send prompts, and cancel turns.",
-    "detail": "docs/DETAIL.md"
-  }
+  "panelTitle": "DSH Mobile",
+  "heading": "DSH Mobile",
+  "tagline": "Control this DeepSeek Harness from your phone. Pair once, then it connects on its own.",
+  "pairingSection": "Pairing",
+  "pairingHint": "Enter these two on the phone",
+  "fieldAddress": "Address",
+  "fieldPort": "Port",
+  "fieldToken": "Token",
+  "fieldConfig": "Config file",
+  "otherAddresses": "Other reachable addresses: {addresses}",
+  "devicesSection": "Paired phones",
+  "devicesNone": "None yet",
+  "devicesCount": "{count} paired",
+  "devicesEmpty": "Open DSH Mobile on the phone and enter the address and token above to pair.",
+  "hostSection": "This computer",
+  "fieldName": "Name",
+  "fieldDeviceId": "Device ID",
+  "fieldHarness": "Harness",
+  "fieldBridge": "Bridge version",
+  "fieldDiscovery": "LAN discovery",
+  "discoveryOn": "On, port {port}",
+  "discoveryOff": "Off",
+  "copy": "Copy",
+  "copied": "Copied",
+  "loading": "Loading…",
+  "loadFailed": "Could not read bridge state: {reason}",
+  "loadFailedHint": "If the bridge plugin is disabled, enable it on the Plugins page."
 }

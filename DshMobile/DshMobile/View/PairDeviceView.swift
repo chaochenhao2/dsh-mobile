@@ -3,7 +3,8 @@ import SwiftUI
 /// Pairs one computer by address, or by picking it from the LAN scan.
 ///
 /// Replaces the old connect screen. Pairing is deliberate and rare, so it asks
-/// for the address and token once and then the device is remembered.
+/// for the address once and then the device is remembered. A token is only
+/// needed when the computer was configured to require one.
 struct PairDeviceView: View {
     @EnvironmentObject private var store: AppStore
     @Environment(\.dismiss) private var dismiss
@@ -49,8 +50,7 @@ struct PairDeviceView: View {
                             Text("配对").fontWeight(.semibold)
                         }
                     }
-                    .disabled(isPairing || host.trimmingCharacters(in: .whitespaces).isEmpty
-                        || token.trimmingCharacters(in: .whitespaces).isEmpty)
+                    .disabled(isPairing || host.trimmingCharacters(in: .whitespaces).isEmpty)
                 }
             }
             .onAppear { if !isScanning { startScan() } }
@@ -109,13 +109,13 @@ struct PairDeviceView: View {
             SectionLabel(text: "手动填写")
             field(title: "地址", placeholder: "192.168.1.10", text: $host, keyboard: .URL)
             field(title: "端口", placeholder: "5180", text: $port, keyboard: .numberPad)
-            field(title: "令牌", placeholder: "电脑上显示的令牌", text: $token, keyboard: .asciiCapable)
+            field(title: "令牌（可选）", placeholder: "默认无密，留空即可", text: $token, keyboard: .asciiCapable)
         }
     }
 
     private var hintSection: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("在电脑上打开 DSH 的移动桥接插件，即可看到地址与令牌。")
+            Text("默认无需令牌：在电脑侧边栏打开「DSH Mobile」即可看到地址。")
                 .font(.system(size: 11))
                 .foregroundStyle(Theme.textTertiary)
             Text("配对后两端都会记录这台设备，之后打开 App 自动连接。")

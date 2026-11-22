@@ -1,7 +1,29 @@
 {
-  "meta": {
-    "title": "手机桥接",
-    "description": "把当前 Harness 以局域网 HTTP + SSE 暴露给 DSH Mobile iOS App：列出会话、实时跟随转录、发送 prompt、取消回合。",
-    "detail": "docs/DETAIL.md"
-  }
+  "panelTitle": "DSH Mobile",
+  "heading": "DSH Mobile",
+  "tagline": "用手机控制这台电脑上的 DeepSeek Harness。在手机上配对一次，之后自动连接。",
+  "pairingSection": "配对信息",
+  "pairingHint": "在手机上填这两项",
+  "fieldAddress": "地址",
+  "fieldPort": "端口",
+  "fieldToken": "令牌",
+  "fieldConfig": "配置文件",
+  "otherAddresses": "其他可用地址：{addresses}",
+  "devicesSection": "已配对手机",
+  "devicesNone": "还没有",
+  "devicesCount": "{count} 台",
+  "devicesEmpty": "打开手机上的 DSH Mobile，填入上面的地址与令牌即可完成配对。",
+  "hostSection": "这台电脑",
+  "fieldName": "名称",
+  "fieldDeviceId": "设备 ID",
+  "fieldHarness": "Harness",
+  "fieldBridge": "桥接版本",
+  "fieldDiscovery": "局域网发现",
+  "discoveryOn": "已开启，端口 {port}",
+  "discoveryOff": "已关闭",
+  "copy": "复制",
+  "copied": "已复制",
+  "loading": "读取中…",
+  "loadFailed": "无法读取桥接状态：{reason}",
+  "loadFailedHint": "如果桥接插件未启用，请在「插件」页启用它。"
 }

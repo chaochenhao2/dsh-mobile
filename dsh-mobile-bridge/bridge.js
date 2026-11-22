@@ -100,10 +100,27 @@ function readSettingsFile(path) {
 function writeSettingsFile(path, value) {
   try {
     mkdirSync(dirname(path), { recursive: true })
-    writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`, 'utf8')
+    // `path` is bookkeeping the caller attaches to settings so later writes know
+    // where to go; persisting it would fold that path into the file itself and
+    // carry it forward on every read.
+    const { path: _ignored, ...persisted } = value
+    writeFileSync(path, `${JSON.stringify(persisted, null, 2)}\n`, 'utf8')
   } catch (error) {
     console.warn(`dsh-mobile-bridge: could not write ${path}: ${error?.message ?? error}`)
   }
+}
+
+/**
+ * Read the authentication mode.
+ * @param candidates - values in priority order.
+ * @param fallback - mode to use when none is usable.
+ * @returns `token` or `open`.
+ */
+function pickAuth(candidates, fallback) {
+  for (const candidate of candidates) {
+    if (candidate === 'token' || candidate === 'open') return candidate
+  }
+  return fallback
 }
 
 /**
@@ -153,11 +170,16 @@ function resolveSettings(rowConfig) {
   const path = join(homeDirectory(), 'mobile-bridge', 'config.json')
   const stored = readSettingsFile(path)
   const config = typeof rowConfig === 'object' && rowConfig !== null ? rowConfig : {}
+  // Absent means open: the bridge is a LAN convenience, and pairing with a long
+  // token typed on a phone is the main reason it was painful. A deployment that
+  // wants the token back sets `auth: "token"` in config.json.
+  const auth = pickAuth([config.auth, stored.auth], 'open')
   const persistedToken = typeof stored.token === 'string' && stored.token.length >= 16 ? stored.token : undefined
   const nextToken = persistedToken ?? randomBytes(16).toString('hex')
   const settings = {
     host: pickHost([config.host, stored.host], DEFAULT_HOST),
     port: pickPort([config.port, stored.port], DEFAULT_PORT),
+    auth,
     discovery: pickBoolean([config.discovery, stored.discovery], true),
     discoveryPort: pickPort([config.discoveryPort, stored.discoveryPort], DEFAULT_DISCOVERY_PORT),
     includeTokenInBeacon: pickBoolean([config.includeTokenInBeacon, stored.includeTokenInBeacon], false),
@@ -171,6 +193,7 @@ function resolveSettings(rowConfig) {
   const changed = persistedToken === undefined
     || stored.port !== settings.port
     || stored.host !== settings.host
+    || stored.auth !== settings.auth
     || stored.discovery !== settings.discovery
     || stored.discoveryPort !== settings.discoveryPort
     || stored.includeTokenInBeacon !== settings.includeTokenInBeacon
@@ -332,24 +355,43 @@ function preferredAddress() {
  * @param status - HTTP status code.
  * @param value - JSON-serializable body.
  */
-function sendJson(res, status, value) {
+function sendJson(res, status, value, settings, origin) {
+    // An omitted pair yields no permissive origin, which is the safe default:
+    // a response without the header cannot be read cross-origin.
   const body = Buffer.from(`${JSON.stringify(value)}\n`, 'utf8')
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
     'content-length': String(body.byteLength),
     'cache-control': 'no-store',
-    ...corsHeaders(),
+    ...corsHeaders(settings, origin),
   })
   res.end(body)
 }
 
 /**
- * CORS headers, so a desktop browser can exercise the same API while debugging.
- * @returns the shared header set.
+ * CORS headers for a request.
+ *
+ * Only a page served from this machine gets a permissive origin. The native app
+ * sends no `Origin` and needs none of this, so an open bridge never advertises
+ * itself to a website it did not come from: with `*` any page could read the
+ * transcript cross-origin while the tokenless API accepted the call.
+ * @param settings - bridge settings; a token-protected bridge is safe with `*`.
+ * @param origin - the request's `Origin` header, when present.
+ * @returns the header set.
  */
-function corsHeaders() {
+function corsHeaders(settings, origin) {
+  // Mirror the admission rule: a token-protected bridge may advertise any origin
+  // because the token gates every call, while an open one may only re-affirm a
+  // local page. Echoing a foreign origin would promise access that `isAuthorized`
+  // then refuses, which is inconsistent and reads as consent to the browser.
+  const localOrigin = typeof origin === 'string' && origin !== ''
+    && (origin.startsWith('http://127.0.0.1:')
+      || origin.startsWith('http://localhost:')
+      || origin.startsWith('http://[::1]:'))
+  const allowed = settings?.auth === 'token' ? '*' : (localOrigin ? origin : null)
   return {
-    'access-control-allow-origin': '*',
+    ...(allowed === null ? {} : { 'access-control-allow-origin': allowed }),
+    ...(allowed === null ? {} : { vary: 'origin' }),
     'access-control-allow-headers': 'authorization, content-type, x-dsh-token',
     'access-control-allow-methods': 'GET, POST, OPTIONS',
   }
@@ -393,6 +435,39 @@ function tokenMatches(presented, expected) {
   const right = Buffer.from(expected, 'utf8')
   if (left.length !== right.length) return false
   return timingSafeEqual(left, right)
+}
+
+/**
+ * Whether a request is admissible under this bridge's authentication mode.
+ *
+ * With a token configured, the caller must present it. Without one, the bridge
+ * is open on the LAN, so two cheaper checks take over: a browser-originated
+ * request must come from a page on this machine, which stops any website from
+ * reaching the API cross-origin, and the caller must not be replaying a form
+ * post from elsewhere.
+ *
+ * A page on this machine is allowed because the Harness UI itself is served from
+ * localhost and the settings panel reads through the same rules.
+ * @param req - the request being served.
+ * @param url - its parsed URL.
+ * @param settings - bridge settings.
+ * @returns whether the request may proceed.
+ */
+function isAuthorized(req, url, settings) {
+  if (settings.auth === 'token') {
+    return tokenMatches(presentedToken(req, url), settings.token)
+  }
+  const origin = req.headers.origin
+  if (typeof origin === 'string' && origin !== '' && origin !== 'null') {
+    // `Origin` is the browser's own claim about the calling page and cannot be
+    // forged by page script, so it is the check that actually blocks a hostile
+    // site. The native app sends no Origin at all.
+    const local = origin.startsWith('http://127.0.0.1:')
+      || origin.startsWith('http://localhost:')
+      || origin.startsWith('http://[::1]:')
+    if (!local) return false
+  }
+  return true
 }
 
 /**
@@ -792,6 +867,50 @@ function startStateWatcher(ctx, sessionId, abort, write, initial) {
 // ---------------------------------------------------------------------------
 
 /**
+ * Whether a request came from this machine.
+ *
+ * The panel endpoint is unauthenticated by necessity — the page displaying the
+ * token cannot already hold it — so it must be unreachable from the network.
+ * @param req - the incoming request.
+ * @returns true only for a loopback peer address.
+ */
+function isLoopbackRequest(req) {
+  const address = req.socket?.remoteAddress ?? ''
+  // IPv4 loopback, IPv6 loopback, and the IPv4-mapped form Node reports when the
+  // listener is bound to a dual-stack socket.
+  return address === '127.0.0.1'
+    || address === '::1'
+    || address === '::ffff:127.0.0.1'
+}
+
+/**
+ * Settings the in-app panel renders.
+ *
+ * Reports the pairing token, the dialable addresses, and the paired devices, all
+ * of which the person needs in order to pair a phone. Callers must be loopback;
+ * `handleRequest` enforces that.
+ * @param ctx - the Host plugin context.
+ * @param settings - bridge settings.
+ * @returns the panel state.
+ */
+async function panelState(ctx, settings) {
+  const payload = await infoPayload(ctx, settings)
+  return {
+    device: deviceIdentity(settings),
+    token: settings.token,
+    port: settings.port,
+    discovery: settings.discovery
+      ? { enabled: true, port: settings.discoveryPort }
+      : { enabled: false, port: null },
+    bridge: payload.bridge,
+    dsh: payload.dsh,
+    host: payload.host,
+    pairedDevices: pairedDevices(settings),
+    configPath: settings.path,
+  }
+}
+
+/**
  * Read this machine's stable device identity.
  *
  * The id is generated once and persisted next to the bridge settings, so a phone
@@ -806,7 +925,7 @@ function deviceIdentity(settings) {
     // random id keeps two installs from ever colliding.
     settings.deviceId = randomUUID()
     try {
-      writeFileSync(settings.path, JSON.stringify(settings, null, 2), 'utf8')
+      writeSettingsFile(settings.path, settings)
     } catch (error) {
       // A read-only settings file still yields a usable in-process identity.
     }
@@ -842,7 +961,7 @@ function rememberDevice(settings, record) {
   const merged = [...existing, record]
   settings.pairedDevices = merged
   try {
-    writeFileSync(settings.path, JSON.stringify(settings, null, 2), 'utf8')
+    writeSettingsFile(settings.path, settings)
   } catch (error) {
     // The pairing still works for this session even if it cannot be persisted.
   }
@@ -918,7 +1037,7 @@ async function fileScope(ctx, controller, sessionId, signal) {
  * @param sessionId - the Session whose files are read.
  * @param selection - absolute paths chosen on the phone.
  */
-async function sendArchive(ctx, controller, res, sessionId, selection) {
+async function sendArchive(ctx, controller, req, res, sessionId, selection) {
   const service = ctx.get('workspaceFiles')
   const signal = new AbortController().signal
   const scope = await fileScope(ctx, controller, sessionId, signal)
@@ -930,7 +1049,7 @@ async function sendArchive(ctx, controller, res, sessionId, selection) {
   // One file is sent as itself, never wrapped in a ZIP: the person asked for
   // that file, and an archive would both rename it and buffer it in memory.
   if (selection.length === 1) {
-    const direct = await sendSingleFile(ctx, service, scope, res, selection[0], signal)
+    const direct = await sendSingleFile(ctx, service, scope, req, res, selection[0], signal)
     if (direct) return
     // Not a regular file after all (a folder, or a vanished path): fall through
     // to the archive path so the selection still produces something.
@@ -958,7 +1077,7 @@ async function sendArchive(ctx, controller, res, sessionId, selection) {
     'content-disposition': `attachment; filename*=UTF-8''${encodeURIComponent(fileName)}`,
     'cache-control': 'no-store',
     ...(incomplete === 0 ? {} : { 'x-skipped-entries': String(incomplete) }),
-    ...corsHeaders(),
+    ...corsHeaders(settings, origin),
     'access-control-expose-headers': 'x-skipped-entries, content-disposition',
   })
   // The archive lives in a temporary file, so it reaches the phone by stream
@@ -987,7 +1106,7 @@ async function sendArchive(ctx, controller, res, sessionId, selection) {
  * @param signal - cancellation for the stat.
  * @returns whether the file was sent; false when it is not a regular file.
  */
-async function sendSingleFile(ctx, service, scope, res, absolute, signal) {
+async function sendSingleFile(ctx, service, scope, req, res, absolute, signal) {
   let stat
   try {
     stat = await service.stat(scope, absolute, signal)
@@ -1004,7 +1123,7 @@ async function sendSingleFile(ctx, service, scope, res, absolute, signal) {
     'content-length': String(stat.bytes),
     'content-disposition': `attachment; filename*=UTF-8''${encodeURIComponent(name)}`,
     'cache-control': 'no-store',
-    ...corsHeaders(),
+    ...corsHeaders(settings, origin),
     'access-control-expose-headers': 'content-disposition',
   })
   const stream = createReadStream(absolute)
@@ -1693,7 +1812,7 @@ async function handleRequest(ctx, settings, req, res) {
   const segments = url.pathname.split('/').filter((segment) => segment !== '')
   try {
     if (req.method === 'OPTIONS') {
-      res.writeHead(204, corsHeaders())
+      res.writeHead(204, corsHeaders(settings, req.headers.origin))
       res.end()
       return
     }
@@ -1701,10 +1820,24 @@ async function handleRequest(ctx, settings, req, res) {
       sendJson(res, 200, { ok: true, protocol: PROTOCOL, bridge: BRIDGE_VERSION })
       return
     }
-    if (!tokenMatches(presentedToken(req, url), settings.token)) {
+    // The settings panel runs in the Harness page on this machine, so it needs
+    // the pairing facts without already holding the token it is meant to show.
+    // This route is therefore unauthenticated but restricted to a loopback
+    // caller: a phone on the LAN cannot read it.
+    if (segments.length === 3 && segments[0] === 'api' && segments[1] === 'panel' && segments[2] === 'state') {
+      if (!isLoopbackRequest(req)) {
+        sendJson(res, 403, { error: 'forbidden', message: 'This endpoint is loopback-only.' })
+        return
+      }
+      sendJson(res, 200, await panelState(ctx, settings))
+      return
+    }
+    if (!isAuthorized(req, url, settings)) {
       sendJson(res, 401, {
         error: 'unauthorized',
-        message: 'Send the bridge token as `Authorization: Bearer <token>` or `?token=<token>`.',
+        message: settings.auth === 'token'
+          ? 'Send the bridge token as `Authorization: Bearer <token>` or `?token=<token>`.'
+          : 'Cross-origin access to an open bridge is refused; a browser must call from this machine.',
       })
       return
     }
@@ -1717,7 +1850,16 @@ async function handleRequest(ctx, settings, req, res) {
       const payload = await infoPayload(ctx, settings)
       // The identity travels with every info read, so a phone can learn which
       // computer it just reached and detect a changed address for a known one.
-      sendJson(res, 200, { ...payload, device: deviceIdentity(settings) })
+      //
+      // The token is included too: this endpoint already requires the token as a
+      // bearer credential, so returning it reveals nothing to a caller that does
+      // not hold it, and it is the one place a person can read it back when
+      // pairing a second device.
+      sendJson(res, 200, {
+        ...payload,
+        device: deviceIdentity(settings),
+        bridge: { ...payload.bridge, token: settings.token },
+      })
       return
     }
     if (segments[1] === 'devices' && segments.length === 2 && req.method === 'GET') {
@@ -1754,7 +1896,7 @@ async function handleRequest(ctx, settings, req, res) {
       const target = decodeURIComponent(segments[2] ?? '')
       settings.pairedDevices = pairedDevices(settings).filter((entry) => entry.deviceId !== target)
       try {
-        writeFileSync(settings.path, JSON.stringify(settings, null, 2), 'utf8')
+        writeSettingsFile(settings.path, settings)
       } catch (error) {
         sendJson(res, 500, { error: 'devices/persist-failed', message: String(error?.message ?? error) })
         return
@@ -1906,7 +2048,7 @@ async function handleRequest(ctx, settings, req, res) {
           sendJson(res, 400, { error: 'bad-request', message: '`paths` must list at least one path.' })
           return
         }
-        await sendArchive(ctx, controller, res, sessionId, selection)
+        await sendArchive(ctx, controller, req, res, sessionId, selection)
         return
       }
       if (tail === 'prompt' && req.method === 'POST') {
@@ -2093,7 +2235,7 @@ async function streamSession(ctx, req, res, sessionId, url) {
     'cache-control': 'no-cache, no-transform',
     connection: 'keep-alive',
     'x-accel-buffering': 'no',
-    ...corsHeaders(),
+    ...corsHeaders(settings, origin),
   })
   /**
    * Send one SSE frame and swallow write failures on a closed peer.
@@ -2279,9 +2421,13 @@ export function startBridge(ctx, config = {}) {
     const stopBeacon = startBeacon(settings)
     server.listen(settings.port, settings.host, () => {
       listening = true
-      ctx.logger.info(
-        `dsh-mobile-bridge: http://${preferredAddress()}:${settings.port} (token in ${settings.path})`,
-      )
+      const address = preferredAddress()
+      const identity = deviceIdentity(settings)
+      // Print the token, not where it lives: pairing fails without it, and asking
+      // someone to open a JSON file to find it is a poor answer.
+      ctx.logger.info(`dsh-mobile-bridge: 设备名称 ${identity.name} (${identity.deviceId})`)
+      ctx.logger.info(`dsh-mobile-bridge: 地址 http://${address}:${settings.port}`)
+      ctx.logger.info(`dsh-mobile-bridge: 令牌 ${settings.token}`)
     })
     return () => {
       stopBeacon()

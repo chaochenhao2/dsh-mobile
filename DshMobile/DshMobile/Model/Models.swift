@@ -317,9 +317,14 @@ struct Endpoint: Codable, Equatable, Sendable {
     var port: Int = 5180
     var token: String = ""
 
+    /// Whether this endpoint can be dialled.
+    ///
+    /// An empty token is valid: the bridge defaults to open pairing, and only a
+    /// deployment that sets `auth: "token"` in its config rejects a request for
+    /// missing credentials. Requiring a token here would make the default
+    /// configuration unusable from the app.
     var isValid: Bool {
         !host.trimmingCharacters(in: .whitespaces).isEmpty
-            && !token.trimmingCharacters(in: .whitespaces).isEmpty
             && (1...65_535).contains(port)
     }
 
