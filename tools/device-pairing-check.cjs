@@ -36,7 +36,9 @@ function take(name) {
 const harness = `
 const { randomUUID } = require('node:crypto')
 const { hostname, platform } = require('node:os')
-const { writeFileSync } = require('node:fs')
+const { writeFileSync, mkdirSync } = require('node:fs')
+const { dirname } = require('node:path')
+${take('writeSettingsFile')}
 ${take('deviceIdentity')}
 ${take('pairedDevices')}
 ${take('rememberDevice')}
