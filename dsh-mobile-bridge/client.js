@@ -221,7 +221,7 @@ window.__ModuleLoader__.load({
       const preferred = state.host?.candidates?.find(
         (candidate) => candidate.address === state.host?.preferredAddress,
       ) ?? state.host?.candidates?.[0]
-      const address = preferred ? `${preferred.address}` : '未知'
+      const address = preferred ? preferred.address : t('unknownAddress')
       const others = (state.host?.candidates ?? [])
         .filter((candidate) => candidate.address !== preferred?.address)
         .map((candidate) => `${candidate.address} (${candidate.kind})`)

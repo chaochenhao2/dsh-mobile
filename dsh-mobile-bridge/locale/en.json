@@ -25,5 +25,6 @@
   "copied": "Copied",
   "loading": "Loading…",
   "loadFailed": "Could not read bridge state: {reason}",
-  "loadFailedHint": "If the bridge plugin is disabled, enable it on the Plugins page."
+  "loadFailedHint": "If the bridge plugin is disabled, enable it on the Plugins page.",
+  "unknownAddress": "Unknown"
 }

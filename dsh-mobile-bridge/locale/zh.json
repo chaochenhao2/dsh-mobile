@@ -25,5 +25,6 @@
   "copied": "已复制",
   "loading": "读取中…",
   "loadFailed": "无法读取桥接状态：{reason}",
-  "loadFailedHint": "如果桥接插件未启用，请在「插件」页启用它。"
+  "loadFailedHint": "如果桥接插件未启用，请在「插件」页启用它。",
+  "unknownAddress": "未知"
 }
