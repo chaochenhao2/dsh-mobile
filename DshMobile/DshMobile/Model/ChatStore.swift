@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 
 /// One Session's live transcript.
 ///
