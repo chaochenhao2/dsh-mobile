@@ -2026,7 +2026,7 @@ async function handleRequest(ctx, settings, req, res) {
         return
       }
       if (tail === 'stream' && req.method === 'GET') {
-        await streamSession(ctx, req, res, sessionId, url)
+        await streamSession(ctx, settings, req, res, sessionId, url)
         return
       }
       if (tail === 'files' && req.method === 'GET') {
@@ -2222,12 +2222,13 @@ function safeWebUrl(ctx) {
 /**
  * Stream one Session as Server-Sent Events of transcript operators.
  * @param ctx - the Host plugin context.
+ * @param settings - resolved bridge settings, for the response's CORS rule.
  * @param req - the incoming request.
  * @param res - the response being written.
  * @param sessionId - the Session to follow.
  * @param url - the parsed request URL.
  */
-async function streamSession(ctx, req, res, sessionId, url) {
+async function streamSession(ctx, settings, req, res, sessionId, url) {
   const abort = new AbortController()
   req.on('close', () => abort.abort())
   res.writeHead(200, {
@@ -2235,7 +2236,7 @@ async function streamSession(ctx, req, res, sessionId, url) {
     'cache-control': 'no-cache, no-transform',
     connection: 'keep-alive',
     'x-accel-buffering': 'no',
-    ...corsHeaders(settings, origin),
+    ...corsHeaders(settings, req.headers.origin),
   })
   /**
    * Send one SSE frame and swallow write failures on a closed peer.
