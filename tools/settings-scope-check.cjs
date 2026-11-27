@@ -1,16 +1,36 @@
 /**
- * Find references to `settings` inside functions that do not declare or receive it.
+ * Find identifiers used but not declared inside a function's own scope.
  *
- * The CORS change added `settings` to several writers, and a function that
- * references it without a parameter compiles fine but throws at request time —
- * exactly the 500 that a stream request hit.
+ * The CORS change threaded `settings` and `origin` through several response
+ * writers. A writer that references either without receiving it compiles fine
+ * and throws at request time, which is how a download answered 500
+ * "settings is not defined" after the stream had already been fixed the same way.
+ *
+ * Only a parameter in the function's own signature counts: a call such as
+ * `corsHeaders(settings, ...)` passes the value, it does not declare it. An
+ * earlier version of this check accepted any `(settings,` occurrence as a
+ * declaration, which is exactly why it missed the bug it exists to catch.
  */
 
 const fs = require('node:fs')
 
-const path = 'dsh-mobile-bridge/bridge.js'
+const path = process.env.DSH_SCOPE_TARGET ?? 'dsh-mobile-bridge/bridge.js'
 const source = fs.readFileSync(path, 'utf8')
 const lines = source.split('\n')
+
+/** Identifiers that must be declared where they are used. */
+const WATCHED = ['settings', 'origin']
+
+/** Functions that legitimately own `settings` without receiving it. */
+const OWNERS = new Set([
+  'resolveSettings',
+  'writeSettingsFile',
+  'rememberDevice',
+  'deviceIdentity',
+  'panelState',
+  'startBeacon',
+  'startBridge',
+])
 
 let failures = 0
 /**
@@ -24,7 +44,7 @@ function check(label, ok, detail) {
   console.log(`  ${ok ? 'ok  ' : 'FAIL'} ${label}${ok || !detail ? '' : ` — ${detail}`}`)
 }
 
-// Locate every top-level function with its parameter list and body extent.
+// Locate every top-level function with its parameter names and body extent.
 const functions = []
 for (let index = 0; index < lines.length; index += 1) {
   const match = lines[index].match(/^(?:async )?function (\w+)\(([^)]*)\)/)
@@ -39,29 +59,43 @@ for (let index = 0; index < lines.length; index += 1) {
     }
     if (started && depth <= 0) { end = cursor; break }
   }
-  functions.push({ name: match[1], params: match[2], start: index, end })
+  const params = match[2]
+    .split(',')
+    .map((entry) => entry.trim().split(/[=:]/)[0].trim())
+    .filter(Boolean)
+  functions.push({ name: match[1], params, start: index, end })
 }
-
-const setterNames = new Set(['resolveSettings', 'writeSettingsFile', 'rememberDevice', 'deviceIdentity', 'panelState', 'startBeacon', 'startBridge'])
 
 for (const fn of functions) {
-  const body = lines.slice(fn.start, fn.end + 1).join('\n')
-  if (!/\bsettings\b/.test(body)) continue
-  // A local binding of the same name is not the bridge settings object.
-  const localBinding = /(?:const|let|var)\s+settings\s*=/.test(body)
-  if (localBinding) {
-    console.log(`  --   ${fn.name} declares its own settings`)
-    continue
+  // Strip string literals before scanning: prose in an error message can contain
+  // a watched word such as "Cross-origin" without referring to any variable.
+  const raw = lines.slice(fn.start + 1, fn.end + 1).join('\n')
+  const body = raw
+    .replace(/`(?:[^`\\]|\\.)*`/g, '``')
+    .replace(/'(?:[^'\\]|\\.)*'/g, "''")
+    .replace(/"(?:[^"\\]|\\.)*"/g, '""')
+
+  for (const identifier of WATCHED) {
+    // A property read (`row.origin`) and an object key (`origin:`) are not
+    // variable references, so neither counts as a use of the bare identifier.
+    const usage = new RegExp(`(^|[^.\\w])${identifier}(?![\\w:])`)
+    if (!usage.test(body)) continue
+
+    // A same-named local binding shadows nothing and is not the bridge value.
+    const localBinding = new RegExp(`(?:const|let|var)\\s+${identifier}\\s*=`).test(body)
+    if (localBinding) {
+      console.log(`  --   ${fn.name} declares its own ${identifier}`)
+      continue
+    }
+
+    const declared = fn.params.includes(identifier) || (identifier === 'settings' && OWNERS.has(fn.name))
+    if (!declared) {
+      check(`${fn.name} uses ${identifier}`, false, `params were (${fn.params.join(', ')})`)
+      continue
+    }
+    check(`${fn.name} uses ${identifier}`, true)
   }
-  const declares = /\bsettings\b/.test(fn.params) || setterNames.has(fn.name)
-  // A nested arrow function may legitimately receive settings from its owner.
-  const nested = fn.params.includes('settings') || body.match(/\(settings[),]/) !== null
-  if (!declares && !nested) {
-    check(`${fn.name} uses settings`, false, `params were (${fn.params})`)
-    continue
-  }
-  check(`${fn.name} uses settings`, true)
 }
 
-console.log(failures === 0 ? '\nsettings references coherent' : `\n${failures} failure(s)`)
+console.log(failures === 0 ? '\nidentifier scope coherent' : `\n${failures} failure(s)`)
 process.exitCode = failures === 0 ? 0 : 1

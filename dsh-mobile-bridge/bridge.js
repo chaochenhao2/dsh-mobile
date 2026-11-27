@@ -1059,7 +1059,7 @@ async function fileScope(ctx, controller, sessionId, signal) {
  * @param sessionId - the Session whose files are read.
  * @param selection - absolute paths chosen on the phone.
  */
-async function sendArchive(ctx, controller, req, res, sessionId, selection) {
+async function sendArchive(ctx, settings, controller, req, res, sessionId, selection) {
   const service = ctx.get('workspaceFiles')
   const signal = new AbortController().signal
   const scope = await fileScope(ctx, controller, sessionId, signal)
@@ -1071,7 +1071,7 @@ async function sendArchive(ctx, controller, req, res, sessionId, selection) {
   // One file is sent as itself, never wrapped in a ZIP: the person asked for
   // that file, and an archive would both rename it and buffer it in memory.
   if (selection.length === 1) {
-    const direct = await sendSingleFile(ctx, service, scope, req, res, selection[0], signal)
+    const direct = await sendSingleFile(ctx, settings, service, scope, req, res, selection[0], signal)
     if (direct) return
     // Not a regular file after all (a folder, or a vanished path): fall through
     // to the archive path so the selection still produces something.
@@ -1099,7 +1099,7 @@ async function sendArchive(ctx, controller, req, res, sessionId, selection) {
     'content-disposition': `attachment; filename*=UTF-8''${encodeURIComponent(fileName)}`,
     'cache-control': 'no-store',
     ...(incomplete === 0 ? {} : { 'x-skipped-entries': String(incomplete) }),
-    ...corsHeaders(settings, origin),
+    ...corsHeaders(settings, req.headers.origin),
     'access-control-expose-headers': 'x-skipped-entries, content-disposition',
   })
   // The archive lives in a temporary file, so it reaches the phone by stream
@@ -1128,7 +1128,7 @@ async function sendArchive(ctx, controller, req, res, sessionId, selection) {
  * @param signal - cancellation for the stat.
  * @returns whether the file was sent; false when it is not a regular file.
  */
-async function sendSingleFile(ctx, service, scope, req, res, absolute, signal) {
+async function sendSingleFile(ctx, settings, service, scope, req, res, absolute, signal) {
   let stat
   try {
     stat = await service.stat(scope, absolute, signal)
@@ -1145,7 +1145,7 @@ async function sendSingleFile(ctx, service, scope, req, res, absolute, signal) {
     'content-length': String(stat.bytes),
     'content-disposition': `attachment; filename*=UTF-8''${encodeURIComponent(name)}`,
     'cache-control': 'no-store',
-    ...corsHeaders(settings, origin),
+    ...corsHeaders(settings, req.headers.origin),
     'access-control-expose-headers': 'content-disposition',
   })
   const stream = createReadStream(absolute)
@@ -2326,7 +2326,7 @@ async function handleRequest(ctx, settings, req, res) {
           sendJson(res, 400, { error: 'bad-request', message: '`paths` must list at least one path.' })
           return
         }
-        await sendArchive(ctx, controller, req, res, sessionId, selection)
+        await sendArchive(ctx, settings, controller, req, res, sessionId, selection)
         return
       }
       if (tail === 'upload' && req.method === 'POST') {
