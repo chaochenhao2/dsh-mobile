@@ -1,5 +1,7 @@
 import SwiftUI
 import UIKit
+import PhotosUI
+import UniformTypeIdentifiers
 
 /// One Session's conversation, followed live.
 struct ChatView: View {
@@ -11,7 +13,22 @@ struct ChatView: View {
     @State private var expandedReasoning: Set<String> = []
     @State private var showsModelPicker = false
     @State private var showsFileBrowser = false
+    /// Files queued for the next prompt, including ones still uploading.
+    @State private var attachments: [PendingAttachment] = []
+    @State private var showsAttachmentMenu = false
+    @State private var showsPhotoPicker = false
+    @State private var showsFileImporter = false
+    @State private var photoSelection: [PhotosPickerItem] = []
     @FocusState private var isComposerFocused: Bool
+
+    /// Whether the composer has anything to send.
+    private var canSend: Bool {
+        let hasText = !draft.trimmed.isEmpty
+        let hasReady = attachments.contains { $0.isReady }
+        // While an upload is still running the send button stays idle rather
+        // than promising to deliver a file that has no path yet.
+        return (hasText || hasReady) && !attachments.contains { $0.isUploading }
+    }
 
     private let title: String
 
@@ -368,7 +385,26 @@ struct ChatView: View {
             }
             .padding(.horizontal, 18)
 
+            // Pending attachments sit above the input so the person sees what is
+            // about to be sent, including any that failed to upload.
+            if !attachments.isEmpty {
+                attachmentStrip
+            }
+
             HStack(alignment: .bottom, spacing: 10) {
+                Button {
+                    showsAttachmentMenu = true
+                } label: {
+                    Image(systemName: "plus.circle")
+                        .font(.system(size: 21))
+                        .foregroundStyle(Theme.textSecondary)
+                        .frame(width: 34, height: 42)
+                }
+                .confirmationDialog("添加附件", isPresented: $showsAttachmentMenu) {
+                    Button("照片与视频") { showsPhotoPicker = true }
+                    Button("文件") { showsFileImporter = true }
+                    Button("取消", role: .cancel) {}
+                }
                 TextField("给 Harness 发消息…", text: $draft, axis: .vertical)
                     .focused($isComposerFocused)
                     .lineLimit(1...5)
@@ -393,10 +429,10 @@ struct ChatView: View {
                             .foregroundStyle(.white)
                             .frame(width: 42, height: 42)
                             .background(
-                                Circle().fill(draft.trimmed.isEmpty ? Theme.surfaceRaised : Theme.accent)
+                                Circle().fill(canSend ? Theme.accent : Theme.surfaceRaised)
                             )
                     }
-                    .disabled(draft.trimmed.isEmpty)
+                    .disabled(!canSend)
                 }
             }
             .padding(.horizontal, 14)
@@ -408,6 +444,84 @@ struct ChatView: View {
             Rectangle()
                 .fill(Theme.border)
                 .frame(height: 1)
+        }
+        .photosPicker(
+            isPresented: $showsPhotoPicker,
+            selection: $photoSelection,
+            maxSelectionCount: 10,
+            matching: .any(of: [.images, .videos])
+        )
+        .fileImporter(
+            isPresented: $showsFileImporter,
+            allowedContentTypes: [.item],
+            allowsMultipleSelection: true
+        ) { result in
+            handleFileImport(result)
+        }
+        .onChange(of: photoSelection) { _ in
+            loadPickedPhotos()
+        }
+    }
+
+    /// Horizontal strip of pending attachments.
+    private var attachmentStrip: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(attachments) { attachment in
+                    attachmentChip(attachment)
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 6)
+        }
+    }
+
+    private func attachmentChip(_ attachment: PendingAttachment) -> some View {
+        VStack(spacing: 3) {
+            ZStack {
+                if let thumbnail = attachment.thumbnail {
+                    Image(uiImage: thumbnail)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                } else {
+                    Image(systemName: attachment.glyph)
+                        .font(.system(size: 18))
+                        .foregroundStyle(Theme.accentAlt)
+                }
+                if attachment.isUploading {
+                    Color.black.opacity(0.45)
+                    ProgressView().tint(.white).scaleEffect(0.7)
+                }
+                if attachment.failure != nil {
+                    Color.black.opacity(0.55)
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 14))
+                        .foregroundStyle(Theme.warning)
+                }
+            }
+            .frame(width: 58, height: 58)
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(
+                        attachment.failure == nil ? Theme.border : Theme.warning.opacity(0.7),
+                        lineWidth: 1
+                    )
+            )
+            .overlay(alignment: .topTrailing) {
+                Button {
+                    attachments.removeAll { $0.id == attachment.id }
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 15))
+                        .foregroundStyle(.white, Color.black.opacity(0.6))
+                }
+                .offset(x: 4, y: -4)
+            }
+
+            Text(attachment.sizeText)
+                .font(.system(size: 9, design: .monospaced))
+                .foregroundStyle(Theme.textTertiary)
         }
     }
 
@@ -426,10 +540,87 @@ struct ChatView: View {
 
     private func send() {
         let text = draft.trimmed
-        guard !text.isEmpty else { return }
+        let ready = attachments.filter { $0.isReady }
+        guard !text.isEmpty || !ready.isEmpty else { return }
         draft = ""
+        attachments = []
         Task {
-            await chat.send(text)
+            await chat.send(text, attachments: ready)
+        }
+    }
+
+    /// Enqueue files picked from the photo library.
+    ///
+    /// Each item is loaded and uploaded independently: one failure leaves the
+    /// others usable instead of discarding the whole selection.
+    private func loadPickedPhotos() {
+        let items = photoSelection
+        photoSelection = []
+        guard !items.isEmpty else { return }
+        for (index, item) in items.enumerated() {
+            Task {
+                let load = Task {
+                    try? await item.loadTransferable(type: Data.self)
+                }
+                guard let data = await load.value else { return }
+                // A picked item carries no file name, so one is derived from the
+                // type and position; the bridge prefixes a timestamp regardless.
+                let type = item.supportedContentTypes.first
+                let extensionPart = type?.preferredFilenameExtension ?? "bin"
+                let name = "IMG-\(Int(Date().timeIntervalSince1970))-\(index).\(extensionPart)"
+                let picked = PickedFile.make(name: name, type: type, data: data)
+                await upload(picked)
+            }
+        }
+    }
+
+    /// Enqueue files chosen from the document picker.
+    /// @param result - the picker's outcome.
+    private func handleFileImport(_ result: Result<[URL], Error>) {
+        guard case let .success(urls) = result else { return }
+        for url in urls {
+            Task {
+                // Files outside the app's container need explicit access before
+                // their bytes can be read.
+                let scoped = url.startAccessingSecurityScopedResource()
+                defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+                guard let data = try? Data(contentsOf: url) else { return }
+                let type = UTType(filenameExtension: url.pathExtension)
+                let picked = PickedFile.make(name: url.lastPathComponent, type: type, data: data)
+                await upload(picked)
+            }
+        }
+    }
+
+    /// Upload one file and keep its row in the strip until the send clears it.
+    /// @param picked - the bytes to upload.
+    private func upload(_ picked: PickedFile) async {
+        // The row is inserted before the upload starts so the spinner is visible
+        // immediately, then replaced with the finished one.
+        let placeholder = PendingAttachment(
+            name: picked.name,
+            kind: picked.kind,
+            bytes: picked.data.count,
+            thumbnail: picked.isImage ? UIImage(data: picked.data) : nil,
+            remotePath: nil,
+            isUploading: true,
+            failure: nil
+        )
+        attachments.append(placeholder)
+        let finished = await chat.upload(picked)
+        if let index = attachments.firstIndex(where: { $0.id == placeholder.id }) {
+            // Keep the published identity so SwiftUI updates the row in place
+            // instead of animating a removal and an insertion.
+            attachments[index] = PendingAttachment(
+                id: placeholder.id,
+                name: finished.name,
+                kind: finished.kind,
+                bytes: finished.bytes,
+                thumbnail: finished.thumbnail ?? placeholder.thumbnail,
+                remotePath: finished.remotePath,
+                isUploading: finished.isUploading,
+                failure: finished.failure
+            )
         }
     }
 }

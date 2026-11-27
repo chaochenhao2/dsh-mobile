@@ -360,14 +360,27 @@ final class ChatStore: ObservableObject {
     /// @param text - what the person typed.
     /// @returns whether the prompt was accepted.
     @discardableResult
-    func send(_ text: String) async -> Bool {
+    func send(_ text: String, attachments: [PendingAttachment] = []) async -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return false }
+        let ready = attachments.filter { $0.isReady }
+        // An attachment-only prompt is legitimate: a photo can be the message.
+        guard !trimmed.isEmpty || !ready.isEmpty else { return false }
         do {
             // One identity per submission: a retried send is deduplicated by the
             // Session, so a dropped response cannot enqueue the message twice.
             let requestID = UUID().uuidString
-            try await api.prompt(sessionID: sessionID, text: trimmed, requestID: requestID)
+            try await api.prompt(
+                sessionID: sessionID,
+                text: trimmed,
+                requestID: requestID,
+                attachments: ready.map { attachment in
+                    PromptAttachment(
+                        path: attachment.remotePath ?? "",
+                        kind: attachment.kind,
+                        name: attachment.name
+                    )
+                }
+            )
             isRunning = true
             startedAt = Date()
             lastError = nil
@@ -378,6 +391,39 @@ final class ChatStore: ObservableObject {
             lastError = Self.describe(error)
             return false
         }
+    }
+
+    /// Upload one picked file and return the attachment row to show.
+    ///
+    /// The row is published before the bytes leave the phone so the composer can
+    /// show a spinner, then updated in place once the path comes back.
+    /// @param file - the bytes, name, and media type.
+    /// @returns the completed attachment, or one carrying its failure.
+    func upload(_ file: PickedFile) async -> PendingAttachment {
+        let thumbnail = file.isImage ? UIImage(data: file.data) : nil
+        var attachment = PendingAttachment(
+            name: file.name,
+            kind: file.kind,
+            bytes: file.data.count,
+            thumbnail: thumbnail,
+            remotePath: nil,
+            isUploading: true,
+            failure: nil
+        )
+        do {
+            let stored = try await api.upload(sessionID: sessionID, file: file)
+            attachment.remotePath = stored.path
+            attachment.isUploading = false
+            attachment.failure = nil
+        } catch {
+            attachment.isUploading = false
+            if RetryPolicy.isCancellation(error) {
+                attachment.failure = "已取消"
+            } else {
+                attachment.failure = Self.describe(error)
+            }
+        }
+        return attachment
     }
 
     /// Stop the active turn without dropping queued input.

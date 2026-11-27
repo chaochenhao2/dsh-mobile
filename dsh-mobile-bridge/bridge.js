@@ -10,10 +10,20 @@
 
 import { createServer } from 'node:http'
 import { createSocket } from 'node:dgram'
+import { execFileSync } from 'node:child_process'
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { hostname, networkInterfaces, platform, release, homedir, tmpdir } from 'node:os'
 import { dirname, join, basename } from 'node:path'
-import { mkdirSync, readFileSync, writeFileSync, createWriteStream, createReadStream, unlinkSync } from 'node:fs'
+import {
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+  createWriteStream,
+  createReadStream,
+  unlinkSync,
+  readdirSync,
+  statSync,
+} from 'node:fs'
 
 /** Loader id for the single row this bundle inserts. */
 export const name = 'dsh-mobile-bridge'
@@ -38,6 +48,16 @@ const BEACON_INTERVAL_MS = 3_000
 const TOOL_RESULT_CHARS = 4_000
 /** Recursion bound for directory selection; guards against symlink loops. */
 const MAX_ARCHIVE_DEPTH = 32
+/** Largest single upload the bridge accepts, streamed to disk rather than buffered. */
+const MAX_UPLOAD_BYTES = 512 * 1024 * 1024
+/** Folder under the workspace that holds uploads; hidden on Windows. */
+const UPLOAD_DIR = '.dsh'
+/** Subfolder inside it, so uploads stay separated from other Harness state. */
+const UPLOAD_SUBDIR = 'uploads'
+/** A prompt may carry this many attachments in one submission. */
+const MAX_ATTACHMENTS = 20
+/** Largest image inlined as a prompt part; bigger ones are named by path instead. */
+const MAX_INLINE_IMAGE_BYTES = 8 * 1024 * 1024
 
 /**
  * Describe what the app can rely on, so it can degrade instead of failing.
@@ -52,6 +72,8 @@ const CAPABILITIES = [
   'session.create',
   'models.list',
   'session.select-model',
+  'session.upload',
+  'session.attach',
 ]
 
 // ---------------------------------------------------------------------------
@@ -1463,6 +1485,262 @@ function baseName(path) {
 }
 
 // ---------------------------------------------------------------------------
+// Session uploads
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve the folder that holds one Session's uploads.
+ *
+ * Uploads live under `<workspace>/.dsh/uploads` so they sit beside the rest of
+ * the Harness state and stay out of the way of the project itself. The `.dsh`
+ * directory is marked hidden on Windows, where a leading dot carries no such
+ * meaning.
+ * @param ctx - the Host plugin context.
+ * @param controller - the Host Session API.
+ * @param sessionId - the Session receiving the uploads.
+ * @param signal - cancellation for the root lookup.
+ * @returns the absolute upload directory.
+ */
+async function uploadDirectory(ctx, controller, sessionId, signal) {
+  const root = await sessionRoot(ctx, controller, sessionId, signal)
+  const base = root ?? process.cwd()
+  const hidden = join(base, UPLOAD_DIR)
+  const directory = join(hidden, UPLOAD_SUBDIR)
+  mkdirSync(directory, { recursive: true })
+  if (platform() === 'win32') markHidden(hidden)
+  return directory
+}
+
+/**
+ * Mark a directory hidden on Windows.
+ *
+ * A leading dot is a Unix convention that Explorer ignores, and the person asked
+ * for a hidden folder, so the attribute has to be set explicitly.
+ * @param path - the directory to hide.
+ */
+function markHidden(path) {
+  try {
+    execFileSync('attrib', ['+h', path], { stdio: 'ignore', windowsHide: true })
+  } catch {
+    // Hiding is cosmetic; a failure must not break the upload that created it.
+  }
+}
+
+/**
+ * Reduce a client-supplied name to one safe leaf.
+ *
+ * The name arrives from a phone and may carry separators or traversal, so only
+ * the final segment survives and control characters are dropped.
+ * @param name - the suggested file name.
+ * @param fallback - name to use when nothing usable remains.
+ * @returns a safe leaf name.
+ */
+function safeFileName(name, fallback) {
+  const raw = typeof name === 'string' && name.trim() !== '' ? name.trim() : fallback
+  const leaf = basename(raw.replace(/\\/g, '/'))
+  const cleaned = leaf.replace(/[\u0000-\u001f<>:"|?*]/g, '_').trim()
+  return cleaned === '' || cleaned === '.' || cleaned === '..' ? fallback : cleaned
+}
+
+/**
+ * Receive one uploaded file and write it into the Session's upload folder.
+ *
+ * The body is the raw file, streamed straight to disk: base64 in JSON would
+ * inflate a video by a third and force the whole thing through memory, and the
+ * phone has no reason to encode what it already has as bytes.
+ * @param ctx - the Host plugin context.
+ * @param controller - the Host Session API.
+ * @param req - the request carrying the bytes.
+ * @param res - the response to write.
+ * @param sessionId - the Session receiving the upload.
+ * @param url - the parsed request URL, holding `name` and `mediaType`.
+ */
+async function receiveUpload(ctx, controller, req, res, sessionId, url) {
+  const signal = new AbortController().signal
+  const directory = await uploadDirectory(ctx, controller, sessionId, signal)
+  const suggested = url.searchParams.get('name') ?? ''
+  const mediaType = url.searchParams.get('mediaType') ?? 'application/octet-stream'
+  const name = safeFileName(suggested, `upload-${Date.now()}`)
+  // A timestamp prefix keeps two files with the same name from colliding while
+  // still leaving the original name readable.
+  const stamp = new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14)
+  const target = join(directory, `${stamp}-${name}`)
+
+  const output = createWriteStream(target)
+  let written = 0
+  let aborted = false
+  req.on('aborted', () => {
+    aborted = true
+    output.destroy()
+  })
+  try {
+    for await (const chunk of req) {
+      written += chunk.length
+      if (written > MAX_UPLOAD_BYTES) {
+        aborted = true
+        output.destroy()
+        try {
+          unlinkSync(target)
+        } catch {
+          // A missing partial file is the desired state anyway.
+        }
+        sendJson(res, 413, {
+          error: 'upload/too-large',
+          message: `Upload exceeds ${Math.round(MAX_UPLOAD_BYTES / (1024 * 1024))} MB.`,
+        }, ctx, req.headers.origin)
+        return
+      }
+      if (!output.write(chunk)) {
+        await new Promise((resolve) => output.once('drain', resolve))
+      }
+    }
+    await new Promise((resolve, reject) => {
+      output.end(resolve)
+      output.on('error', reject)
+    })
+  } catch (error) {
+    output.destroy()
+    try {
+      unlinkSync(target)
+    } catch {
+      // Nothing to clean up.
+    }
+    if (!res.headersSent) {
+      sendJson(res, 500, {
+        error: 'upload/failed',
+        message: error?.message ?? String(error),
+      }, ctx, req.headers.origin)
+    }
+    return
+  }
+  if (aborted) return
+
+  sendJson(res, 200, {
+    name,
+    path: target,
+    bytes: written,
+    mediaType,
+    kind: mediaKind(mediaType, name),
+  }, ctx, req.headers.origin)
+}
+
+/**
+ * Classify a file for the prompt builder.
+ * @param mediaType - declared MIME type.
+ * @param name - file name, used when the type is generic.
+ * @returns `image`, `video`, or `file`.
+ */
+function mediaKind(mediaType, name) {
+  if (typeof mediaType === 'string' && mediaType.startsWith('image/')) return 'image'
+  if (typeof mediaType === 'string' && mediaType.startsWith('video/')) return 'video'
+  const extension = String(name).toLowerCase().split('.').pop() ?? ''
+  if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'heic', 'heif'].includes(extension)) return 'image'
+  if (['mp4', 'mov', 'm4v', 'webm', 'avi', 'mkv'].includes(extension)) return 'video'
+  return 'file'
+}
+
+/**
+ * List the files already uploaded for one Session.
+ * @param ctx - the Host plugin context.
+ * @param controller - the Host Session API.
+ * @param res - the response to write.
+ * @param sessionId - the Session whose uploads are listed.
+ * @param origin - the calling page's origin, for the CORS header.
+ */
+async function listUploads(ctx, controller, res, sessionId, origin) {
+  const signal = new AbortController().signal
+  const directory = await uploadDirectory(ctx, controller, sessionId, signal)
+  let entries = []
+  try {
+    entries = readdirSync(directory, { withFileTypes: true })
+      .filter((entry) => entry.isFile())
+      .map((entry) => {
+        const path = join(directory, entry.name)
+        let bytes = 0
+        try {
+          bytes = statSync(path).size
+        } catch {
+          // A file removed mid-listing simply reports no size.
+        }
+        return { name: entry.name, path, bytes, kind: mediaKind('', entry.name) }
+      })
+  } catch {
+    // An unreadable directory reads as empty rather than failing the request.
+  }
+  entries.sort((left, right) => right.name.localeCompare(left.name))
+  sendJson(res, 200, { directory, files: entries }, ctx, origin)
+}
+
+/**
+ * Turn chosen attachments into prompt content parts.
+ *
+ * Images become `image` parts so the model receives them directly. Everything
+ * else — video included, which no current model accepts inline — is named in the
+ * text with its absolute path, so the model can open it with its own tools
+ * instead of the bridge pretending it was attached as pixels.
+ * @param attachments - the client's `{ path, kind }` list.
+ * @param text - the prompt text to extend.
+ * @returns the content parts, in order.
+ */
+function buildPromptContent(attachments, text) {
+  const parts = []
+  const described = []
+  for (const attachment of attachments.slice(0, MAX_ATTACHMENTS)) {
+    const path = typeof attachment?.path === 'string' ? attachment.path : ''
+    if (path === '') continue
+    const name = basename(path)
+    const kind = typeof attachment?.kind === 'string' ? attachment.kind : mediaKind('', name)
+    if (kind === 'image') {
+      const read = readImagePart(path)
+      if (read !== null) {
+        parts.push(read)
+        continue
+      }
+    }
+    described.push(`- ${name}: ${path}`)
+  }
+  if (described.length > 0) {
+    const header = text.trim() === '' ? '' : `${text}\n\n`
+    parts.unshift({
+      type: 'text',
+      text: `${header}以下是本次附带的文件，请按需用工具读取：\n${described.join('\n')}`,
+    })
+  } else if (text.trim() !== '') {
+    parts.unshift({ type: 'text', text })
+  }
+  return parts
+}
+
+/**
+ * Read one image file as a prompt image part.
+ *
+ * A file over the inline limit is skipped so the request still goes through: the
+ * caller then describes it by path like any other file.
+ * @param path - absolute image path.
+ * @returns the image part, or null when it cannot be inlined.
+ */
+function readImagePart(path) {
+  const extension = path.toLowerCase().split('.').pop() ?? ''
+  const mediaType = {
+    png: 'image/png',
+    jpg: 'image/jpeg',
+    jpeg: 'image/jpeg',
+    gif: 'image/gif',
+    webp: 'image/webp',
+  }[extension]
+  if (mediaType === undefined) return null
+  let bytes
+  try {
+    const stat = statSync(path)
+    if (stat.size > MAX_INLINE_IMAGE_BYTES) return null
+    bytes = readFileSync(path)
+  } catch {
+    return null
+  }
+  return { type: 'image', mediaType, data: bytes.toString('base64'), name: basename(path) }
+}
+
+// ---------------------------------------------------------------------------
 // Session reads
 // ---------------------------------------------------------------------------
 
@@ -2051,10 +2329,21 @@ async function handleRequest(ctx, settings, req, res) {
         await sendArchive(ctx, controller, req, res, sessionId, selection)
         return
       }
+      if (tail === 'upload' && req.method === 'POST') {
+        await receiveUpload(ctx, controller, req, res, sessionId, url)
+        return
+      }
+      if (tail === 'uploads' && req.method === 'GET') {
+        await listUploads(ctx, controller, res, sessionId, req.headers.origin)
+        return
+      }
       if (tail === 'prompt' && req.method === 'POST') {
         const body = await readJsonBody(req)
         const text = typeof body.text === 'string' ? body.text : ''
-        if (text.trim() === '') {
+        const attachments = Array.isArray(body.attachments) ? body.attachments : []
+        // An attachment-only prompt is legitimate; only refuse when there is
+        // neither text nor anything attached.
+        if (text.trim() === '' && attachments.length === 0) {
           sendJson(res, 400, { error: 'empty-prompt', message: '`text` must contain non-whitespace characters.' })
           return
         }
@@ -2069,7 +2358,7 @@ async function handleRequest(ctx, settings, req, res) {
           requestId,
           sessionId,
           mode: body.mode === 'steer' ? 'steer' : 'queue',
-          content: [{ type: 'text', text }],
+          content: buildPromptContent(attachments, text),
           ...(typeof body.clientTimeZone === 'string' && body.clientTimeZone !== ''
             ? { clientTimeZone: body.clientTimeZone }
             : {}),

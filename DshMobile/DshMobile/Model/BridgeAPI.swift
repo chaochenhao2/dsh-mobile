@@ -36,6 +36,34 @@ private struct RenameResult: Decodable {
     let title: String?
 }
 
+/// One uploaded file a prompt refers to.
+///
+/// Only the path crosses the wire; the bridge decides whether to inline an image
+/// or name a file for the model's own tools.
+struct PromptAttachment: Equatable {
+    let path: String
+    /// `image`, `video`, or `file`.
+    let kind: String
+    let name: String
+}
+
+/// One file the bridge accepted into the Session's upload folder.
+struct UploadedFile: Decodable, Equatable {
+    let name: String
+    /// Absolute path on the computer, which the prompt refers to.
+    let path: String
+    let bytes: Int
+    let mediaType: String
+    /// `image`, `video`, or `file`.
+    let kind: String
+}
+
+/// Payload of `GET /api/session/:id/uploads`.
+struct StoredUploads: Decodable, Equatable {
+    let directory: String
+    let files: [UploadedFile]
+}
+
 struct BridgeAPI {
     let endpoint: Endpoint
 
@@ -64,6 +92,16 @@ struct BridgeAPI {
     /// Archive downloads can take longer than a JSON call on a large folder,
     /// so they get their own budget instead of the 15-second interactive one.
     private static let downloadSession: URLSession = {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.waitsForConnectivity = false
+        configuration.timeoutIntervalForRequest = 300
+        configuration.timeoutIntervalForResource = 900
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        return URLSession(configuration: configuration)
+    }()
+
+    /// Uploads carry whole files, so they need a generous budget of their own.
+    private static let uploadSession: URLSession = {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.waitsForConnectivity = false
         configuration.timeoutIntervalForRequest = 300
@@ -229,15 +267,27 @@ struct BridgeAPI {
     /// @param sessionID - Session receiving the prompt.
     /// @param text - what the person typed.
     /// @param requestID - stable identity for this submission.
-    func prompt(sessionID: String, text: String, requestID: String) async throws {
+    /// @param attachments - files already uploaded into this Session's folder.
+    func prompt(
+        sessionID: String,
+        text: String,
+        requestID: String,
+        attachments: [PromptAttachment] = []
+    ) async throws {
+        var body: [String: Any] = [
+            "text": text,
+            "clientTimeZone": TimeZone.current.identifier,
+            "requestId": requestID,
+        ]
+        if !attachments.isEmpty {
+            body["attachments"] = attachments.map { attachment in
+                ["path": attachment.path, "kind": attachment.kind, "name": attachment.name]
+            }
+        }
         let _: PromptAcceptance = try await send(
             "POST",
             "/api/session/\(escaped(sessionID))/prompt",
-            body: [
-                "text": text,
-                "clientTimeZone": TimeZone.current.identifier,
-                "requestId": requestID,
-            ],
+            body: body,
             session: Self.session
         )
     }
@@ -345,6 +395,57 @@ struct BridgeAPI {
             body: [:],
             session: Self.session
         )
+    }
+
+    /// Upload one file into the Session's workspace folder.
+    ///
+    /// The body is the raw file rather than base64 in JSON: encoding a video
+    /// would inflate it by a third and force the whole thing through memory on
+    /// both ends for no benefit.
+    /// @param sessionID - Session that will receive the attachment.
+    /// @param file - the bytes, name, and media type.
+    /// @returns the stored file's description, including its absolute path.
+    func upload(sessionID: String, file: PickedFile) async throws -> UploadedFile {
+        var components = URLComponents()
+        components.path = "/api/session/\(sessionID)/upload"
+        components.queryItems = [
+            URLQueryItem(name: "name", value: file.name),
+            URLQueryItem(name: "mediaType", value: file.mediaType),
+        ]
+        let path = components.string ?? "/api/session/\(sessionID)/upload"
+        var request = try makeRequest("POST", path, body: nil)
+        request.setValue(file.mediaType, forHTTPHeaderField: "Content-Type")
+        // The default request timeout is far too short for a large video on a
+        // weak link; uploads get their own budget.
+        return try await Retry.run(maxAttempts: RetryPolicy.maxAttempts) {
+            do {
+                let (data, response) = try await Self.uploadSession.upload(for: request, from: file.data)
+                guard let http = response as? HTTPURLResponse else {
+                    throw BridgeError.transport("没有收到 HTTP 响应")
+                }
+                guard (200..<300).contains(http.statusCode) else {
+                    let text = String(data: data, encoding: .utf8) ?? ""
+                    throw BridgeError.http(status: http.statusCode, body: text)
+                }
+                do {
+                    return try JSONDecoder().decode(UploadedFile.self, from: data)
+                } catch {
+                    throw BridgeError.decoding(error.localizedDescription)
+                }
+            } catch let error as BridgeError {
+                throw error
+            } catch {
+                if RetryPolicy.isCancellation(error) { throw CancellationError() }
+                throw BridgeError.transport(error.localizedDescription)
+            }
+        }
+    }
+
+    /// List the files already uploaded for a Session.
+    /// @param sessionID - Session whose upload folder is read.
+    /// @returns the stored files.
+    func uploads(sessionID: String) async throws -> StoredUploads {
+        try await send("GET", "/api/session/\(escaped(sessionID))/uploads", body: nil, session: Self.session)
     }
 
     /// List one directory level inside a Session's workspace.
