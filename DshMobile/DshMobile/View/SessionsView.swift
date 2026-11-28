@@ -293,11 +293,6 @@ struct SessionsView: View {
                 }
                 .buttonStyle(.plain)
                 Spacer()
-                if let remaining = prompt.remainingSeconds {
-                    Text("\(remaining)s")
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundStyle(Theme.textTertiary)
-                }
             }
             .padding(.top, 2)
         }

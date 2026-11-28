@@ -1499,8 +1499,6 @@ function baseName(path) {
  * the wait expires.
  */
 const pendingQuestions = new Map()
-/** How long a phone has to answer before the request is released. */
-const QUESTION_TIMEOUT_MS = 600_000
 
 /**
  * Publish a question set to waiting phones and wait for an answer.
@@ -1514,47 +1512,62 @@ const QUESTION_TIMEOUT_MS = 600_000
  * @returns the answer the harness applies.
  */
 function awaitPhoneAnswer(ctx, request, next) {
-  if (activeStreamCount() === 0) return next()
-
+  // Same rule as approvals: the phone and the desktop see the same question and
+  // the first answer returns. The harness settles the desktop side itself.
   const id = randomUUID()
+  const createdAt = Date.now()
   return new Promise((resolve, reject) => {
-    let settled = false
-    const settle = (answer) => {
-      if (settled) return
-      settled = true
+    let answered = false
+
+    /** Remove the phone card; safe to call twice. */
+    const clear = () => {
       const entry = pendingQuestions.get(id)
-      if (entry !== undefined) {
-        pendingQuestions.delete(id)
-        clearTimeout(entry.timer)
-      }
+      if (entry !== undefined) clearTimeout(entry.timer)
+      pendingQuestions.delete(id)
+    }
+
+    /** Finish with the phone's answer. */
+    const fromPhone = (answer) => {
+      if (answered) return
+      answered = true
+      clear()
+      ctx.logger.info(`dsh-mobile-bridge: question ${id} answered on the phone`)
       resolve(answer)
     }
-    // Releasing to the desktop is the honest outcome when nobody answers: the
-    // harness keeps its own prompt rather than receiving an invented choice.
-    const release = () => {
-      if (settled) return
-      settled = true
-      const entry = pendingQuestions.get(id)
-      if (entry !== undefined) {
-        pendingQuestions.delete(id)
-        clearTimeout(entry.timer)
-      }
-      next().then(resolve, reject)
-    }
-    const timer = setTimeout(release, QUESTION_TIMEOUT_MS)
+
     pendingQuestions.set(id, {
       id,
-      settle,
-      timer,
-      createdAt: Date.now(),
+      settle: fromPhone,
+      createdAt,
       sessionId: request.agent?.id ?? null,
       callId: request.wait?.callId ?? null,
       questions: normalizeQuestions(request.questions),
     })
+
     if (typeof request.signal?.addEventListener === 'function') {
-      request.signal.addEventListener('abort', release, { once: true })
+      request.signal.addEventListener('abort', () => {
+        if (answered) return
+        answered = true
+        clear()
+        resolve({ answers: [] })
+      }, { once: true })
     }
-    ctx.logger.info(`dsh-mobile-bridge: ${request.questions?.length ?? 0} question(s) waiting on the phone`)
+
+    Promise.resolve()
+      .then(() => next())
+      .then((answer) => {
+        if (answered) return
+        answered = true
+        // The card disappears because the entry is gone, which a poll observes.
+        clear()
+        ctx.logger.info(`dsh-mobile-bridge: question ${id} answered on the desktop`)
+        resolve(answer)
+      }, (error) => {
+        if (answered) return
+        answered = true
+        clear()
+        reject(error)
+      })
   })
 }
 
@@ -1589,7 +1602,6 @@ function questionList() {
   return [...pendingQuestions.values()].map((entry) => ({
     id: entry.id,
     createdAt: entry.createdAt,
-    expiresAt: entry.createdAt + QUESTION_TIMEOUT_MS,
     sessionId: entry.sessionId,
     callId: entry.callId,
     questions: entry.questions,
@@ -1657,14 +1669,12 @@ function settleQuestion(id, answers) {
  * from the phone. An entry is removed on answer, timeout, or cancellation.
  */
 const pendingApprovals = new Map()
-/** How long a phone has to answer before the request fails closed. */
-const APPROVAL_TIMEOUT_MS = 120_000
 
 /**
  * How many transcript streams are open right now.
  *
- * Approval prompts are only intercepted while a phone is actually watching: with
- * no stream open the desktop's own answerers keep full control.
+ * Prompts are offered to the phone whether or not a stream is open, so this is
+ * only reported for diagnostics.
  * @returns the number of open streams.
  */
 function activeStreamCount() {
@@ -1683,36 +1693,77 @@ function activeStreamCount() {
  * @returns the outcome the harness applies.
  */
 function awaitPhoneApproval(ctx, request, next) {
-  // No phone connected is not an error: fall back to whatever answers the
-  // desktop already composed, so behaviour is unchanged without the app.
-  if (activeStreamCount() === 0) return next()
-
+  // The phone and the desktop are the same person, so both are offered the
+  // prompt at once and whichever answers first wins. The harness owns the
+  // desktop side already, so only the phone half is tracked here.
   const id = randomUUID()
+  const createdAt = Date.now()
   return new Promise((resolve) => {
-    const settle = (outcome) => {
+    let answered = false
+
+    /** Finish with the phone's answer. */
+    const fromPhone = (outcome) => {
+      if (answered) return
+      answered = true
       const entry = pendingApprovals.get(id)
-      if (entry === undefined) return
+      if (entry !== undefined) clearTimeout(entry.timer)
       pendingApprovals.delete(id)
-      clearTimeout(entry.timer)
-      ctx.logger.info(`dsh-mobile-bridge: approval ${id} -> ${outcome}`)
+      ctx.logger.info(`dsh-mobile-bridge: approval ${id} answered on the phone -> ${outcome}`)
       resolve(outcome)
     }
-    const timer = setTimeout(() => settle('cancelled'), APPROVAL_TIMEOUT_MS)
+
+    /** Finish with the desktop's answer, if it gave one. */
+    const fromDesktop = () => {
+      if (answered) return
+      answered = true
+      const entry = pendingApprovals.get(id)
+      if (entry !== undefined) clearTimeout(entry.timer)
+      // Removing before waiting is what makes the phone card disappear: a poll
+      // no longer sees it once the desktop has decided.
+      pendingApprovals.delete(id)
+      ctx.logger.info(`dsh-mobile-bridge: approval ${id} answered on the desktop`)
+      next().then(resolve, () => resolve('unavailable'))
+    }
+
+    // No timer here: the desktop's own prompt has its own timeout, and
+    // duplicating it would race the harness. The entry is dropped when either
+    // side answers or the request is cancelled.
     pendingApprovals.set(id, {
       id,
-      settle,
-      timer,
+      settle: fromPhone,
+      createdAt,
       toolName: request.toolName,
       reason: typeof request.reason === 'string' ? request.reason : null,
       displayReason: request.displayReason ?? null,
       callId: request.callId ?? null,
       sessionId: request.agent?.id ?? null,
-      createdAt: Date.now(),
     })
+
     if (typeof request.signal?.addEventListener === 'function') {
-      request.signal.addEventListener('abort', () => settle('cancelled'), { once: true })
+      request.signal.addEventListener('abort', () => {
+        if (answered) return
+        answered = true
+        pendingApprovals.delete(id)
+        // The harness settles an aborted request itself.
+        resolve('cancelled')
+      }, { once: true })
     }
-    ctx.logger.info(`dsh-mobile-bridge: approval ${id} requested for ${request.toolName}`)
+
+    // Offer both at once. A rejection from the desktop half must not leave the
+    // phone waiting forever.
+    Promise.resolve()
+      .then(() => next())
+      .then((outcome) => {
+        if (answered) return
+        answered = true
+        pendingApprovals.delete(id)
+        resolve(outcome)
+      }, () => {
+        if (answered) return
+        answered = true
+        pendingApprovals.delete(id)
+        resolve('unavailable')
+      })
   })
 }
 
@@ -1729,7 +1780,6 @@ function approvalList() {
     callId: entry.callId,
     sessionId: entry.sessionId,
     createdAt: entry.createdAt,
-    expiresAt: entry.createdAt + APPROVAL_TIMEOUT_MS,
   }))
 }
 
