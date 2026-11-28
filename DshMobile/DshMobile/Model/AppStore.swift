@@ -27,6 +27,9 @@ final class AppStore: ObservableObject {
     @Published private(set) var approvals: [ApprovalPrompt] = []
     /// Device each pending approval came from, so the answer goes back correctly.
     private var approvalDevices: [String: Device] = [:]
+    /// Question sets waiting for the person, across every reachable device.
+    @Published private(set) var questions: [QuestionBatch] = []
+    private var questionDevices: [String: Device] = [:]
 
     /// Rows after the archive and subagent filters.
     ///
@@ -176,6 +179,69 @@ final class AppStore: ObservableObject {
         }
         approvals = collected
         approvalDevices = owners
+    }
+
+    // MARK: - Questions
+
+    /// Read pending `ask_user_question` requests from every reachable device.
+    func refreshQuestions() async {
+        let online = registry.onlineDevices
+        guard !online.isEmpty else {
+            if !questions.isEmpty {
+                questions = []
+                questionDevices = [:]
+            }
+            return
+        }
+        var collected: [QuestionBatch] = []
+        var owners: [String: Device] = [:]
+        for device in online {
+            var client = BridgeAPI(endpoint: device.endpoint)
+            client.onRetry = nil
+            guard let payload = try? await client.questions() else { continue }
+            for batch in payload.items {
+                let key = "\(device.id)/\(batch.id)"
+                collected.append(
+                    QuestionBatch(
+                        id: key,
+                        createdAt: batch.createdAt,
+                        expiresAt: batch.expiresAt,
+                        sessionId: batch.sessionId,
+                        callId: batch.callId,
+                        questions: batch.questions
+                    )
+                )
+                owners[key] = device
+            }
+        }
+        questions = collected
+        questionDevices = owners
+    }
+
+    /// Submit answers for one question set.
+    /// @param batch - the request being answered.
+    /// @param answers - one answer per question.
+    func submit(_ batch: QuestionBatch, answers: [QuestionAnswer]) async {
+        guard let slash = batch.id.firstIndex(of: "/") else { return }
+        let deviceID = String(batch.id[batch.id.startIndex..<slash])
+        let rawID = String(batch.id[batch.id.index(after: slash)...])
+        guard let device = registry.device(id: deviceID) ?? questionDevices[batch.id] else { return }
+        var client = BridgeAPI(endpoint: device.endpoint)
+        client.onRetry = nil
+        do {
+            try await client.answerQuestion(id: rawID, answers: answers)
+            questions.removeAll { $0.id == batch.id }
+            questionDevices[batch.id] = nil
+        } catch {
+            if RetryPolicy.isCancellation(error) { return }
+            // A 409 means the request already settled; dropping it is correct,
+            // showing an error would not be.
+            if case let .http(status, _) = (error as? BridgeError ?? .transport("")), status == 409 {
+                questions.removeAll { $0.id == batch.id }
+                return
+            }
+            lastError = Self.describe(error)
+        }
     }
 
     /// Answer one approval prompt.

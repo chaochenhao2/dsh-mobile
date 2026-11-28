@@ -36,6 +36,12 @@ private struct RenameResult: Decodable {
     let title: String?
 }
 
+/// Reply to a question answer; only the acknowledgement matters.
+private struct QuestionAnswerReceipt: Decodable {
+    let ok: Bool?
+    let id: String?
+}
+
 /// Reply to an approval answer; only the acknowledgement matters.
 private struct ApprovalAnswerReceipt: Decodable {
     let ok: Bool?
@@ -452,6 +458,29 @@ struct BridgeAPI {
     /// @returns the stored files.
     func uploads(sessionID: String) async throws -> StoredUploads {
         try await send("GET", "/api/session/\(escaped(sessionID))/uploads", body: nil, session: Self.session)
+    }
+
+    /// Read the `ask_user_question` requests waiting for an answer.
+    func questions() async throws -> QuestionsPayload {
+        try await send("GET", "/api/questions", body: nil, session: Self.session)
+    }
+
+    /// Answer one question set.
+    /// @param id - the request to settle.
+    /// @param answers - one answer per question.
+    func answerQuestion(id: String, answers: [QuestionAnswer]) async throws {
+        let encoded = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
+        let body: [String: Any] = ["answers": answers.map { answer in
+            var entry: [String: Any] = ["id": answer.id, "selected": answer.selected]
+            if let custom = answer.custom { entry["custom"] = custom }
+            return entry
+        }]
+        let _: QuestionAnswerReceipt = try await send(
+            "POST",
+            "/api/questions/\(encoded)/answer",
+            body: body,
+            session: Self.session
+        )
     }
 
     /// Read the approval prompts waiting for a decision.

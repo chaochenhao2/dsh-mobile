@@ -14,6 +14,8 @@ struct SessionsView: View {
     /// Session being renamed, and the draft title.
     @State private var renaming: DeviceSession?
     @State private var renameDraft = ""
+    /// Question set currently being answered; the sheet is driven by it.
+    @State private var activeQuestion: QuestionBatch?
     /// Drives navigation; the value is the merged key `deviceId/sessionId`.
     @State private var path: [String] = []
 
@@ -118,8 +120,27 @@ struct SessionsView: View {
             .task {
                 while !Task.isCancelled {
                     await store.refreshApprovals()
+                    await store.refreshQuestions()
+                    // Pick up the first pending batch so it is not missed while
+                    // the person is looking at the list.
+                    if activeQuestion == nil, let first = store.questions.first {
+                        activeQuestion = first
+                    }
                     try? await Task.sleep(nanoseconds: 3_000_000_000)
                 }
+            }
+            .sheet(item: $activeQuestion) { batch in
+                QuestionSheet(
+                    batch: batch,
+                    onSubmit: { answers in
+                        let target = batch
+                        activeQuestion = nil
+                        Task { await store.submit(target, answers: answers) }
+                    },
+                    onCancel: {
+                        activeQuestion = nil
+                    }
+                )
             }
             .refreshable {
                 await store.refreshSessions()
@@ -160,6 +181,54 @@ struct SessionsView: View {
         } else {
             sessionList
         }
+    }
+
+    /// Question sets waiting for an answer.
+    ///
+    /// The tool call blocks until answered, so this sits above everything else in
+    /// the list.
+    private var questionBanner: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "questionmark.bubble.fill")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.accent)
+                Text("\(store.questions.count) 个待回答问题")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Theme.textPrimary)
+                Spacer()
+            }
+            ForEach(store.questions) { batch in
+                Button {
+                    activeQuestion = batch
+                } label: {
+                    HStack(spacing: 8) {
+                        Text(batch.questions.first?.question ?? "回答提问")
+                            .font(.system(size: 12))
+                            .foregroundStyle(Theme.textSecondary)
+                            .lineLimit(2)
+                            .multilineTextAlignment(.leading)
+                        Spacer(minLength: 0)
+                        Text("回答")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 5)
+                            .background(Theme.accent, in: Capsule())
+                    }
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Theme.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(12)
+        .background(Theme.accent.opacity(0.10), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(Theme.accent.opacity(0.35), lineWidth: 1)
+        )
     }
 
     /// Pending approval prompts, each answerable inline.
@@ -310,6 +379,9 @@ struct SessionsView: View {
                 filterBar
                 if let error = store.lastError {
                     ErrorBanner(message: error)
+                }
+                if !store.questions.isEmpty {
+                    questionBanner
                 }
                 if !store.approvals.isEmpty {
                     approvalBanner

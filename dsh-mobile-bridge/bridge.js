@@ -1488,6 +1488,157 @@ function baseName(path) {
 }
 
 // ---------------------------------------------------------------------------
+// User questions
+// ---------------------------------------------------------------------------
+
+/**
+ * Pending `ask_user_question` prompts keyed by an id the phone answers.
+ *
+ * The harness asks through a waterfall and waits on the returned promise, so the
+ * resolver is held here until the phone answers, the request is cancelled, or
+ * the wait expires.
+ */
+const pendingQuestions = new Map()
+/** How long a phone has to answer before the request is released. */
+const QUESTION_TIMEOUT_MS = 600_000
+
+/**
+ * Publish a question set to waiting phones and wait for an answer.
+ *
+ * Returning `next()` would let the desktop decide; with a phone watching, the
+ * phone decides. Unlike approvals, a question has no safe default: releasing it
+ * on timeout lets the desktop answerer take over rather than inventing a reply.
+ * @param ctx - the Host plugin context.
+ * @param request - the pending question set.
+ * @param next - the desktop's own answerers.
+ * @returns the answer the harness applies.
+ */
+function awaitPhoneAnswer(ctx, request, next) {
+  if (activeStreamCount() === 0) return next()
+
+  const id = randomUUID()
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const settle = (answer) => {
+      if (settled) return
+      settled = true
+      const entry = pendingQuestions.get(id)
+      if (entry !== undefined) {
+        pendingQuestions.delete(id)
+        clearTimeout(entry.timer)
+      }
+      resolve(answer)
+    }
+    // Releasing to the desktop is the honest outcome when nobody answers: the
+    // harness keeps its own prompt rather than receiving an invented choice.
+    const release = () => {
+      if (settled) return
+      settled = true
+      const entry = pendingQuestions.get(id)
+      if (entry !== undefined) {
+        pendingQuestions.delete(id)
+        clearTimeout(entry.timer)
+      }
+      next().then(resolve, reject)
+    }
+    const timer = setTimeout(release, QUESTION_TIMEOUT_MS)
+    pendingQuestions.set(id, {
+      id,
+      settle,
+      timer,
+      createdAt: Date.now(),
+      sessionId: request.agent?.id ?? null,
+      callId: request.wait?.callId ?? null,
+      questions: normalizeQuestions(request.questions),
+    })
+    if (typeof request.signal?.addEventListener === 'function') {
+      request.signal.addEventListener('abort', release, { once: true })
+    }
+    ctx.logger.info(`dsh-mobile-bridge: ${request.questions?.length ?? 0} question(s) waiting on the phone`)
+  })
+}
+
+/**
+ * Reduce a question set to what the phone renders.
+ *
+ * The last option is always the free-text one: the official UI appends it the
+ * same way, so a set that already lists a custom-looking option still ends with
+ * exactly one input row.
+ * @param questions - the harness question items.
+ * @returns the wire questions.
+ */
+function normalizeQuestions(questions) {
+  return (questions ?? []).map((item) => ({
+    id: String(item.id ?? ''),
+    question: typeof item.question === 'string' ? item.question : '',
+    detail: typeof item.detail === 'string' ? item.detail : null,
+    header: typeof item.header === 'string' ? item.header : null,
+    multiSelect: item.multiSelect === true,
+    options: (item.options ?? []).map((option) => ({
+      label: String(option.label ?? ''),
+      description: typeof option.description === 'string' ? option.description : null,
+    })),
+  }))
+}
+
+/**
+ * Snapshot the pending question sets.
+ * @returns one entry per unanswered request.
+ */
+function questionList() {
+  return [...pendingQuestions.values()].map((entry) => ({
+    id: entry.id,
+    createdAt: entry.createdAt,
+    expiresAt: entry.createdAt + QUESTION_TIMEOUT_MS,
+    sessionId: entry.sessionId,
+    callId: entry.callId,
+    questions: entry.questions,
+  }))
+}
+
+/**
+ * Answer one pending question set.
+ *
+ * Answers are matched by question id, and an entry with neither a selection nor
+ * custom text is dropped: the harness treats a missing id as unanswered, while
+ * an empty answer would look like the person chose nothing.
+ * @param id - the request to settle.
+ * @param answers - the phone's answers, keyed by question id.
+ * @returns whether a request was waiting.
+ */
+function settleQuestion(id, answers) {
+  const entry = pendingQuestions.get(id)
+  if (entry === undefined) return false
+  const known = new Set(entry.questions.map((question) => question.id))
+  const shaped = []
+  for (const answer of Array.isArray(answers) ? answers : []) {
+    const questionId = typeof answer?.id === 'string' ? answer.id : ''
+    if (!known.has(questionId)) continue
+    const selected = Array.isArray(answer.selected)
+      ? answer.selected.filter((value) => typeof value === 'string' && value !== '')
+      : []
+    const custom = typeof answer.custom === 'string' && answer.custom.trim() !== ''
+      ? answer.custom.trim()
+      : undefined
+    if (selected.length === 0 && custom === undefined) continue
+    shaped.push({
+      id: questionId,
+      selected,
+      ...(custom === undefined ? {} : { custom }),
+    })
+  }
+  if (shaped.length === 0) return false
+  // The harness expects a complete answer set; a question the person skipped is
+  // reported with an empty selection so the model knows it was declined.
+  for (const question of entry.questions) {
+    if (shaped.some((answer) => answer.id === question.id)) continue
+    shaped.push({ id: question.id, selected: [] })
+  }
+  entry.settle({ answers: shaped })
+  return true
+}
+
+// ---------------------------------------------------------------------------
 // Approval prompts
 // ---------------------------------------------------------------------------
 
@@ -2343,6 +2494,30 @@ async function handleRequest(ctx, settings, req, res) {
       sendJson(res, 200, { self: deviceIdentity(settings), devices: settings.pairedDevices })
       return
     }
+    if (segments[1] === 'questions' && segments.length === 2 && req.method === 'GET') {
+      sendJson(res, 200, { items: questionList() }, settings, req.headers.origin)
+      return
+    }
+    if (segments[1] === 'questions' && segments[3] === 'answer' && req.method === 'POST') {
+      const body = await readJsonBody(req)
+      const id = decodeURIComponent(segments[2] ?? '')
+      if (!Array.isArray(body.answers)) {
+        sendJson(res, 400, {
+          error: 'bad-request',
+          message: '`answers` must be an array.',
+        }, settings, req.headers.origin)
+        return
+      }
+      if (!settleQuestion(id, body.answers)) {
+        sendJson(res, 409, {
+          error: 'question/not-pending',
+          message: 'That question is no longer waiting for an answer.',
+        }, settings, req.headers.origin)
+        return
+      }
+      sendJson(res, 200, { ok: true, id }, settings, req.headers.origin)
+      return
+    }
     if (segments[1] === 'approvals' && segments.length === 2 && req.method === 'GET') {
       sendJson(res, 200, { items: approvalList() }, settings, req.headers.origin)
       return
@@ -2914,6 +3089,12 @@ export function startBridge(ctx, config = {}) {
   ctx.effect(
     () => ctx.on('approval/request', (request, next) => awaitPhoneApproval(ctx, request, next)),
     'dsh-mobile-bridge: phone approvals',
+  )
+  // Questions follow the same rule: intercept only while a phone is watching,
+  // and delegate otherwise so the desktop flow is untouched.
+  ctx.effect(
+    () => ctx.on('user-questions/request', (request, next) => awaitPhoneAnswer(ctx, request, next)),
+    'dsh-mobile-bridge: phone questions',
   )
   ctx.effect(() => {
     const stopBeacon = startBeacon(settings)
