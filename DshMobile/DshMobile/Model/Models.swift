@@ -92,6 +92,10 @@ struct SessionRow: Decodable, Identifiable, Equatable {
     let cwd: String?
     let agentAvailable: Bool
     let origin: String?
+    /// Whether this Session is a delegated child of another.
+    let subagent: Bool
+    /// Whether the owning workspace has archived it.
+    let archived: Bool
 
     /// Memberwise construction for rows the app synthesizes itself, such as the
     /// optimistic row used to navigate into a Session the list has not caught up
@@ -104,7 +108,9 @@ struct SessionRow: Decodable, Identifiable, Equatable {
         blank: Bool,
         cwd: String?,
         agentAvailable: Bool,
-        origin: String?
+        origin: String?,
+        subagent: Bool = false,
+        archived: Bool = false
     ) {
         self.id = id
         self.title = title
@@ -114,6 +120,37 @@ struct SessionRow: Decodable, Identifiable, Equatable {
         self.cwd = cwd
         self.agentAvailable = agentAvailable
         self.origin = origin
+        self.subagent = subagent
+        self.archived = archived
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case title
+        case updatedAt
+        case running
+        case blank
+        case cwd
+        case agentAvailable
+        case origin
+        case subagent
+        case archived
+    }
+
+    /// Decode a row, defaulting the newer flags for bridges that predate them.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        title = (try? container.decode(String.self, forKey: .title)) ?? "New session"
+        updatedAt = try? container.decode(Double.self, forKey: .updatedAt)
+        running = (try? container.decode(Bool.self, forKey: .running)) ?? false
+        blank = (try? container.decode(Bool.self, forKey: .blank)) ?? false
+        cwd = try? container.decode(String.self, forKey: .cwd)
+        agentAvailable = (try? container.decode(Bool.self, forKey: .agentAvailable)) ?? false
+        origin = try? container.decode(String.self, forKey: .origin)
+        subagent = (try? container.decode(Bool.self, forKey: .subagent))
+            ?? (origin == "subagent")
+        archived = (try? container.decode(Bool.self, forKey: .archived)) ?? false
     }
 
     /// Copy this row with a new title, leaving every other field intact.
@@ -128,7 +165,9 @@ struct SessionRow: Decodable, Identifiable, Equatable {
             blank: blank,
             cwd: cwd,
             agentAvailable: agentAvailable,
-            origin: origin
+            origin: origin,
+            subagent: subagent,
+            archived: archived
         )
     }
 

@@ -59,6 +59,9 @@ const MAX_ATTACHMENTS = 20
 /** Largest image inlined as a prompt part; bigger ones are named by path instead. */
 const MAX_INLINE_IMAGE_BYTES = 8 * 1024 * 1024
 
+/** Open transcript streams, so approval interception knows a phone is watching. */
+const OPEN_STREAMS = new Set()
+
 /**
  * Describe what the app can rely on, so it can degrade instead of failing.
  */
@@ -1485,6 +1488,114 @@ function baseName(path) {
 }
 
 // ---------------------------------------------------------------------------
+// Approval prompts
+// ---------------------------------------------------------------------------
+
+/**
+ * Pending approval requests, keyed by an id the phone uses to answer.
+ *
+ * The harness asks for a decision through a waterfall and waits for the
+ * promise, so the bridge holds the resolver here and hands it to whoever answers
+ * from the phone. An entry is removed on answer, timeout, or cancellation.
+ */
+/**
+ * Pending approval requests, keyed by an id the phone uses to answer.
+ *
+ * The harness asks for a decision through a waterfall and waits for the
+ * promise, so the bridge holds the resolver here and hands it to whoever answers
+ * from the phone. An entry is removed on answer, timeout, or cancellation.
+ */
+const pendingApprovals = new Map()
+/** How long a phone has to answer before the request fails closed. */
+const APPROVAL_TIMEOUT_MS = 120_000
+
+/**
+ * How many transcript streams are open right now.
+ *
+ * Approval prompts are only intercepted while a phone is actually watching: with
+ * no stream open the desktop's own answerers keep full control.
+ * @returns the number of open streams.
+ */
+function activeStreamCount() {
+  return OPEN_STREAMS.size
+}
+
+/**
+ * Publish an approval prompt to waiting phones and wait for a decision.
+ *
+ * Returning `next()` would let the desktop answer; the bridge answers itself so
+ * a phone decides either way. A timeout resolves `cancelled`, which the harness
+ * treats as "no grant", so a lost phone never silently permits an operation.
+ * @param ctx - the Host plugin context.
+ * @param request - the pending decision from the harness.
+ * @param next - the desktop's own answerers, used when the phone cannot answer.
+ * @returns the outcome the harness applies.
+ */
+function awaitPhoneApproval(ctx, request, next) {
+  // No phone connected is not an error: fall back to whatever answers the
+  // desktop already composed, so behaviour is unchanged without the app.
+  if (activeStreamCount() === 0) return next()
+
+  const id = randomUUID()
+  return new Promise((resolve) => {
+    const settle = (outcome) => {
+      const entry = pendingApprovals.get(id)
+      if (entry === undefined) return
+      pendingApprovals.delete(id)
+      clearTimeout(entry.timer)
+      ctx.logger.info(`dsh-mobile-bridge: approval ${id} -> ${outcome}`)
+      resolve(outcome)
+    }
+    const timer = setTimeout(() => settle('cancelled'), APPROVAL_TIMEOUT_MS)
+    pendingApprovals.set(id, {
+      id,
+      settle,
+      timer,
+      toolName: request.toolName,
+      reason: typeof request.reason === 'string' ? request.reason : null,
+      displayReason: request.displayReason ?? null,
+      callId: request.callId ?? null,
+      sessionId: request.agent?.id ?? null,
+      createdAt: Date.now(),
+    })
+    if (typeof request.signal?.addEventListener === 'function') {
+      request.signal.addEventListener('abort', () => settle('cancelled'), { once: true })
+    }
+    ctx.logger.info(`dsh-mobile-bridge: approval ${id} requested for ${request.toolName}`)
+  })
+}
+
+/**
+ * Snapshot the pending approvals for the phone.
+ * @returns one entry per unanswered prompt.
+ */
+function approvalList() {
+  return [...pendingApprovals.values()].map((entry) => ({
+    id: entry.id,
+    toolName: entry.toolName,
+    reason: entry.reason,
+    displayReason: entry.displayReason,
+    callId: entry.callId,
+    sessionId: entry.sessionId,
+    createdAt: entry.createdAt,
+    expiresAt: entry.createdAt + APPROVAL_TIMEOUT_MS,
+  }))
+}
+
+/**
+ * Answer one pending approval.
+ * @param id - the prompt to settle.
+ * @param allow - whether to grant it once.
+ * @returns whether an entry was waiting.
+ */
+function settleApproval(id, allow) {
+  const entry = pendingApprovals.get(id)
+  if (entry === undefined) return false
+  entry.settle(allow ? 'allowed-once' : 'rejected')
+  return true
+}
+
+// ---------------------------------------------------------------------------
 // Session uploads
 // ---------------------------------------------------------------------------
 
@@ -1555,7 +1666,7 @@ function safeFileName(name, fallback) {
  * @param sessionId - the Session receiving the upload.
  * @param url - the parsed request URL, holding `name` and `mediaType`.
  */
-async function receiveUpload(ctx, controller, req, res, sessionId, url) {
+async function receiveUpload(ctx, settings, controller, req, res, sessionId, url) {
   const signal = new AbortController().signal
   const directory = await uploadDirectory(ctx, controller, sessionId, signal)
   const suggested = url.searchParams.get('name') ?? ''
@@ -1587,7 +1698,7 @@ async function receiveUpload(ctx, controller, req, res, sessionId, url) {
         sendJson(res, 413, {
           error: 'upload/too-large',
           message: `Upload exceeds ${Math.round(MAX_UPLOAD_BYTES / (1024 * 1024))} MB.`,
-        }, ctx, req.headers.origin)
+        }, settings, req.headers.origin)
         return
       }
       if (!output.write(chunk)) {
@@ -1609,7 +1720,7 @@ async function receiveUpload(ctx, controller, req, res, sessionId, url) {
       sendJson(res, 500, {
         error: 'upload/failed',
         message: error?.message ?? String(error),
-      }, ctx, req.headers.origin)
+      }, settings, req.headers.origin)
     }
     return
   }
@@ -1621,7 +1732,7 @@ async function receiveUpload(ctx, controller, req, res, sessionId, url) {
     bytes: written,
     mediaType,
     kind: mediaKind(mediaType, name),
-  }, ctx, req.headers.origin)
+  }, settings, req.headers.origin)
 }
 
 /**
@@ -1647,7 +1758,7 @@ function mediaKind(mediaType, name) {
  * @param sessionId - the Session whose uploads are listed.
  * @param origin - the calling page's origin, for the CORS header.
  */
-async function listUploads(ctx, controller, res, sessionId, origin) {
+async function listUploads(ctx, settings, controller, res, sessionId, origin) {
   const signal = new AbortController().signal
   const directory = await uploadDirectory(ctx, controller, sessionId, signal)
   let entries = []
@@ -1668,7 +1779,7 @@ async function listUploads(ctx, controller, res, sessionId, origin) {
     // An unreadable directory reads as empty rather than failing the request.
   }
   entries.sort((left, right) => right.name.localeCompare(left.name))
-  sendJson(res, 200, { directory, files: entries }, ctx, origin)
+  sendJson(res, 200, { directory, files: entries }, settings, origin)
 }
 
 /**
@@ -2052,13 +2163,64 @@ function permissionsPayload(ctx, session) {
 }
 
 /**
+ * Read the set of Session ids that are archived in any workspace.
+ *
+ * The Session summary carries no archive flag: archival is recorded by the
+ * workspace that owns the Session, so membership in a workspace's `sessionIds`
+ * is what marks it archived.
+ * @param ctx - the Host plugin context.
+ * @returns the archived ids, or an empty set when no registry is composed.
+ */
+function archivedSessionIds(ctx) {
+  const registry = ctx.get('workspaceRegistry')
+  const ids = new Set()
+  if (registry === undefined) return ids
+  try {
+    for (const workspace of registry.list()) {
+      for (const id of workspace.sessionIds ?? []) ids.add(id)
+    }
+  } catch (error) {
+    ctx.logger.warn(`dsh-mobile-bridge: archived id read failed: ${error?.message ?? error}`)
+  }
+  return ids
+}
+
+/**
+ * Report whether one Session is a subagent.
+ *
+ * Delegation records `origin: 'subagent'` on the summary; the parent link is a
+ * second signal used when a row predates that field.
+ * @param row - the Session summary.
+ * @returns true for a delegated child.
+ */
+function isSubagentRow(row) {
+  return row?.origin === 'subagent' || (row?.parentSessionId !== undefined && row?.parentSessionId !== null)
+}
+
+/**
+ * Shape one row for the phone, including its delegation and archive state.
+ * @param row - the Session summary.
+ * @param archived - the archived id set.
+ * @returns the wire row.
+ */
+function summarizeWithState(row, archived) {
+  const base = summarize(row)
+  return {
+    ...base,
+    subagent: isSubagentRow(row),
+    archived: archived.has(row.sessionId),
+  }
+}
+
+/**
  * Read a bounded transcript page for one Session.
  * @param controller - the Host Session API.
  * @param sessionId - the Session to read.
  * @param signal - cancellation for the read.
  * @returns the folded nodes, the state, and the page cursor.
  */
-async function readSession(controller, sessionId, signal) {  const page = await controller.events({
+async function readSession(controller, sessionId, signal) {
+  const page = await controller.events({
     address: { kind: 'session', sessionId },
     maxMessages: MAX_HISTORY_MESSAGES,
   }, signal)
@@ -2110,8 +2272,7 @@ async function handleRequest(ctx, settings, req, res) {
       sendJson(res, 200, await panelState(ctx, settings))
       return
     }
-    if (!isAuthorized(req, url, settings)) {
-      sendJson(res, 401, {
+    if (!isAuthorized(req, url, settings)) {      sendJson(res, 401, {
         error: 'unauthorized',
         message: settings.auth === 'token'
           ? 'Send the bridge token as `Authorization: Bearer <token>` or `?token=<token>`.'
@@ -2180,6 +2341,29 @@ async function handleRequest(ctx, settings, req, res) {
         return
       }
       sendJson(res, 200, { self: deviceIdentity(settings), devices: settings.pairedDevices })
+      return
+    }
+    if (segments[1] === 'approvals' && segments.length === 2 && req.method === 'GET') {
+      sendJson(res, 200, { items: approvalList() }, settings, req.headers.origin)
+      return
+    }
+    if (segments[1] === 'approvals' && segments[3] === 'answer' && req.method === 'POST') {
+      const body = await readJsonBody(req)
+      const id = decodeURIComponent(segments[2] ?? '')
+      if (typeof body.allow !== 'boolean') {
+        sendJson(res, 400, { error: 'bad-request', message: '`allow` must be true or false.' }, settings, req.headers.origin)
+        return
+      }
+      if (!settleApproval(id, body.allow)) {
+        // Already answered, expired, or cancelled; the phone should drop the card
+        // rather than show an error, because the outcome is no longer actionable.
+        sendJson(res, 409, {
+          error: 'approval/not-pending',
+          message: 'That request is no longer waiting for a decision.',
+        }, settings, req.headers.origin)
+        return
+      }
+      sendJson(res, 200, { ok: true, id, allow: body.allow }, settings, req.headers.origin)
       return
     }
     if (segments[1] === 'models' && segments.length === 2) {
@@ -2262,9 +2446,20 @@ async function handleRequest(ctx, settings, req, res) {
       if (segments.length === 2 && req.method === 'GET') {
         const signal = new AbortController().signal
         const list = await controller.list({}, signal)
-        const rows = list.items.map(summarize)
+        // Archived membership and delegation are decided here rather than on the
+        // phone: the app receives one row that already says whether it belongs in
+        // a default list.
+        const archived = archivedSessionIds(ctx)
+        const rows = list.items.map((row) => summarizeWithState(row, archived))
         rows.sort((left, right) => (right.updatedAt ?? 0) - (left.updatedAt ?? 0))
-        sendJson(res, 200, { items: rows })
+        sendJson(res, 200, {
+          items: rows,
+          counts: {
+            total: rows.length,
+            subagents: rows.filter((row) => row.subagent).length,
+            archived: rows.filter((row) => row.archived).length,
+          },
+        })
         return
       }
       if (segments.length === 2 && req.method === 'POST') {
@@ -2330,11 +2525,11 @@ async function handleRequest(ctx, settings, req, res) {
         return
       }
       if (tail === 'upload' && req.method === 'POST') {
-        await receiveUpload(ctx, controller, req, res, sessionId, url)
+        await receiveUpload(ctx, settings, controller, req, res, sessionId, url)
         return
       }
       if (tail === 'uploads' && req.method === 'GET') {
-        await listUploads(ctx, controller, res, sessionId, req.headers.origin)
+        await listUploads(ctx, settings, controller, res, sessionId, req.headers.origin)
         return
       }
       if (tail === 'prompt' && req.method === 'POST') {
@@ -2519,6 +2714,10 @@ function safeWebUrl(ctx) {
  */
 async function streamSession(ctx, settings, req, res, sessionId, url) {
   const abort = new AbortController()
+  // Registering the stream is what enables phone approvals; the entry is
+  // removed on every exit path.
+  OPEN_STREAMS.add(res)
+  res.on('close', () => OPEN_STREAMS.delete(res))
   req.on('close', () => abort.abort())
   res.writeHead(200, {
     'content-type': 'text/event-stream; charset=utf-8',
@@ -2707,6 +2906,15 @@ export function startBridge(ctx, config = {}) {
     }
     ctx.logger.warn(`dsh-mobile-bridge: server error: ${error?.message ?? error}`)
   })
+  // Take over approval prompts while a phone is watching.
+  //
+  // The listener must call `next()` when it declines to decide — that is the
+  // waterfall contract — so a bridge with no connected phone behaves exactly as
+  // it did before this plugin existed.
+  ctx.effect(
+    () => ctx.on('approval/request', (request, next) => awaitPhoneApproval(ctx, request, next)),
+    'dsh-mobile-bridge: phone approvals',
+  )
   ctx.effect(() => {
     const stopBeacon = startBeacon(settings)
     server.listen(settings.port, settings.host, () => {

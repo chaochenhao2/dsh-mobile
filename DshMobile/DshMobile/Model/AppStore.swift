@@ -21,6 +21,25 @@ final class AppStore: ObservableObject {
     @Published private(set) var isSearching = false
     @Published private(set) var isLoadingSessions = false
     @Published var lastError: String?
+    /// Which rows the list hides. Persisted, so the choice survives a restart.
+    @Published var filters = SessionFilters()
+    /// Approval prompts waiting for a decision, across every reachable device.
+    @Published private(set) var approvals: [ApprovalPrompt] = []
+    /// Device each pending approval came from, so the answer goes back correctly.
+    private var approvalDevices: [String: Device] = [:]
+
+    /// Rows after the archive and subagent filters.
+    ///
+    /// Filtering here rather than in the view keeps the empty states honest: an
+    /// empty list means "nothing matches your filters", not "nothing loaded".
+    var visibleSessions: [DeviceSession] {
+        sessions.filter { filters.admits($0.row) }
+    }
+
+    /// How many rows the filters are hiding.
+    var hiddenCount: Int {
+        sessions.count - visibleSessions.count
+    }
 
     /// A retry in flight, for the status banner.
     @Published private(set) var isRetrying = false
@@ -105,6 +124,85 @@ final class AppStore: ObservableObject {
     func forget(id: String) {
         registry.remove(id: id)
         sessions = registry.sessions
+    }
+
+    /// Persist a filter change.
+    func saveFilters() {
+        filters.save()
+        // Approval and Session state are independent, but a filter change should
+        // redraw immediately rather than after the next probe.
+        objectWillChange.send()
+    }
+
+    // MARK: - Approvals
+
+    /// Read pending approval prompts from every reachable device.
+    ///
+    /// Probing is unconditional: a prompt blocks the computer's work, so it is
+    /// worth a poll even when the list is not on screen.
+    func refreshApprovals() async {
+        let online = registry.onlineDevices
+        guard !online.isEmpty else {
+            if !approvals.isEmpty {
+                approvals = []
+                approvalDevices = [:]
+            }
+            return
+        }
+        var collected: [ApprovalPrompt] = []
+        var owners: [String: Device] = [:]
+        for device in online {
+            var client = BridgeAPI(endpoint: device.endpoint)
+            client.onRetry = nil
+            guard let payload = try? await client.approvals() else { continue }
+            for prompt in payload.items {
+                // Ids are unique per bridge, but two devices could collide in
+                // theory; prefixing keeps the app's keys distinct.
+                let key = "\(device.id)/\(prompt.id)"
+                collected.append(
+                    ApprovalPrompt(
+                        id: key,
+                        toolName: prompt.toolName,
+                        reason: prompt.reason,
+                        displayReason: prompt.displayReason,
+                        callId: prompt.callId,
+                        sessionId: prompt.sessionId,
+                        createdAt: prompt.createdAt,
+                        expiresAt: prompt.expiresAt
+                    )
+                )
+                owners[key] = device
+            }
+        }
+        approvals = collected
+        approvalDevices = owners
+    }
+
+    /// Answer one approval prompt.
+    /// @param prompt - the prompt being decided.
+    /// @param allow - whether to grant it once.
+    func answer(_ prompt: ApprovalPrompt, allow: Bool) async {
+        // The id carries its device; strip the prefix the app added.
+        guard let slash = prompt.id.firstIndex(of: "/") else { return }
+        let deviceID = String(prompt.id[prompt.id.startIndex..<slash])
+        let rawID = String(prompt.id[prompt.id.index(after: slash)...])
+        guard let device = registry.device(id: deviceID) ?? approvalDevices[prompt.id] else { return }
+        var client = BridgeAPI(endpoint: device.endpoint)
+        client.onRetry = nil
+        do {
+            try await client.answerApproval(id: rawID, allow: allow)
+            approvals.removeAll { $0.id == prompt.id }
+            approvalDevices[prompt.id] = nil
+        } catch {
+            if RetryPolicy.isCancellation(error) { return }
+            // A 409 means the prompt already settled; treat it as success so the
+            // card disappears instead of showing a stale error.
+            if case let .http(status, _) = (error as? BridgeError ?? .transport("")), status == 409 {
+                approvals.removeAll { $0.id == prompt.id }
+                return
+            }
+            lastError = Self.describe(error)
+        }
     }
 
     /// The last probe failure recorded for a device.

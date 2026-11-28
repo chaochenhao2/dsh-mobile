@@ -36,6 +36,12 @@ private struct RenameResult: Decodable {
     let title: String?
 }
 
+/// Reply to an approval answer; only the acknowledgement matters.
+private struct ApprovalAnswerReceipt: Decodable {
+    let ok: Bool?
+    let id: String?
+}
+
 /// One uploaded file a prompt refers to.
 ///
 /// Only the path crosses the wire; the bridge decides whether to inline an image
@@ -446,6 +452,27 @@ struct BridgeAPI {
     /// @returns the stored files.
     func uploads(sessionID: String) async throws -> StoredUploads {
         try await send("GET", "/api/session/\(escaped(sessionID))/uploads", body: nil, session: Self.session)
+    }
+
+    /// Read the approval prompts waiting for a decision.
+    func approvals() async throws -> ApprovalsPayload {
+        try await send("GET", "/api/approvals", body: nil, session: Self.session)
+    }
+
+    /// Answer one approval prompt.
+    ///
+    /// The bridge returns 409 when the prompt already expired or was cancelled,
+    /// which the caller should treat as "nothing to do" rather than an error.
+    /// @param id - the prompt to settle.
+    /// @param allow - whether to grant it once.
+    func answerApproval(id: String, allow: Bool) async throws {
+        let encoded = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
+        let _: ApprovalAnswerReceipt = try await send(
+            "POST",
+            "/api/approvals/\(encoded)/answer",
+            body: ["allow": allow],
+            session: Self.session
+        )
     }
 
     /// List one directory level inside a Session's workspace.

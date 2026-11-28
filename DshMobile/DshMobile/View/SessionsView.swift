@@ -113,6 +113,14 @@ struct SessionsView: View {
             .task {
                 await store.refreshSessions()
             }
+            // Approval prompts block the computer's work, so they are polled
+            // independently of the list and keep running while the app is open.
+            .task {
+                while !Task.isCancelled {
+                    await store.refreshApprovals()
+                    try? await Task.sleep(nanoseconds: 3_000_000_000)
+                }
+            }
             .refreshable {
                 await store.refreshSessions()
             }
@@ -154,14 +162,159 @@ struct SessionsView: View {
         }
     }
 
+    /// Pending approval prompts, each answerable inline.
+    ///
+    /// Shown above the list because an approval blocks the computer's work: the
+    /// person should not have to open the Session to notice it.
+    private var approvalBanner: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "hand.raised.fill")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.warning)
+                Text("\(store.approvals.count) 个授权申请")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Theme.textPrimary)
+                Spacer()
+            }
+            ForEach(store.approvals) { prompt in
+                approvalCard(prompt)
+            }
+        }
+        .padding(12)
+        .background(Theme.warning.opacity(0.10), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(Theme.warning.opacity(0.35), lineWidth: 1)
+        )
+    }
+
+    private func approvalCard(_ prompt: ApprovalPrompt) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(prompt.toolName)
+                .font(.system(size: 13, weight: .medium, design: .monospaced))
+                .foregroundStyle(Theme.textPrimary)
+            if let explanation = prompt.explanation {
+                Text(explanation)
+                    .font(.system(size: 11))
+                    .foregroundStyle(Theme.textSecondary)
+                    .lineLimit(3)
+            }
+            HStack(spacing: 8) {
+                Button {
+                    Task { await store.answer(prompt, allow: true) }
+                } label: {
+                    Text("允许一次")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 7)
+                        .background(Theme.accent, in: Capsule())
+                }
+                .buttonStyle(.plain)
+                Button {
+                    Task { await store.answer(prompt, allow: false) }
+                } label: {
+                    Text("拒绝")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Theme.danger)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 7)
+                        .background(Theme.surfaceRaised, in: Capsule())
+                }
+                .buttonStyle(.plain)
+                Spacer()
+                if let remaining = prompt.remainingSeconds {
+                    Text("\(remaining)s")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(Theme.textTertiary)
+                }
+            }
+            .padding(.top, 2)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        .background(Theme.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    /// Shown when the filters hide everything.
+    private var filteredEmptyState: some View {
+        VStack(spacing: 8) {
+            Image(systemName: "line.3.horizontal.decrease.circle")
+                .font(.system(size: 28, weight: .light))
+                .foregroundStyle(Theme.textTertiary)
+            Text("已隐藏 \(store.hiddenCount) 个会话")
+                .font(.system(size: 13))
+                .foregroundStyle(Theme.textSecondary)
+            Button("全部显示") {
+                store.filters.showsSubagents = true
+                store.filters.showsArchived = true
+                store.saveFilters()
+            }
+            .font(.system(size: 12, weight: .medium))
+            .foregroundStyle(Theme.accent)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 40)
+    }
+
+    /// Toggles for the archive and subagent filters.
+    private var filterBar: some View {
+        HStack(spacing: 8) {
+            filterChip("子代理", isOn: store.filters.showsSubagents) {
+                store.filters.showsSubagents.toggle()
+                store.saveFilters()
+            }
+            filterChip("已归档", isOn: store.filters.showsArchived) {
+                store.filters.showsArchived.toggle()
+                store.saveFilters()
+            }
+            Spacer()
+            if store.hiddenCount > 0 {
+                Text("隐藏 \(store.hiddenCount)")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(Theme.textTertiary)
+            }
+        }
+    }
+
+    private func filterChip(_ title: String, isOn: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 4) {
+                Image(systemName: isOn ? "checkmark.circle.fill" : "circle")
+                    .font(.system(size: 11))
+                Text(title)
+                    .font(.system(size: 11, weight: .medium))
+            }
+            .foregroundStyle(isOn ? Theme.accent : Theme.textTertiary)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(
+                (isOn ? Theme.accent.opacity(0.12) : Theme.surface),
+                in: Capsule()
+            )
+            .overlay(
+                Capsule().strokeBorder(
+                    isOn ? Theme.accent.opacity(0.4) : Theme.border,
+                    lineWidth: 1
+                )
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
     private var sessionList: some View {
         ScrollView {
             LazyVStack(spacing: 10) {
                 header
+                filterBar
                 if let error = store.lastError {
                     ErrorBanner(message: error)
                 }
-                ForEach(store.sessions) { entry in
+                if !store.approvals.isEmpty {
+                    approvalBanner
+                }
+                ForEach(store.visibleSessions) { entry in
                     NavigationLink(value: entry.id) {
                         row(entry)
                     }
@@ -174,6 +327,9 @@ struct SessionsView: View {
                             Label("重命名", systemImage: "pencil")
                         }
                     }
+                }
+                if store.visibleSessions.isEmpty && !store.sessions.isEmpty {
+                    filteredEmptyState
                 }
             }
             .padding(16)

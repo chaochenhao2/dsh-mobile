@@ -98,4 +98,43 @@ for (const fn of functions) {
 }
 
 console.log(failures === 0 ? '\nidentifier scope coherent' : `\n${failures} failure(s)`)
+
+// `sendJson`'s fourth argument is the settings object, which decides CORS. A
+// context passed there reads a non-existent `auth` property and every response
+// on that route answers 500.
+console.log('\nsendJson arguments:')
+const sendJsonCalls = [...source.matchAll(/sendJson\(res, [^;]*?\)\n/g)]
+let wrongArgument = 0
+for (const call of sendJsonCalls) {
+  const text = call[0]
+  // Count top-level commas to find the fourth argument.
+  let depth = 0
+  let commas = 0
+  let start = text.indexOf('(')
+  let fourth = ''
+  for (let index = start + 1; index < text.length; index += 1) {
+    const character = text[index]
+    if ('([{'.includes(character)) depth += 1
+    else if (')]}'.includes(character)) {
+      if (depth === 0) break
+      depth -= 1
+    } else if (character === ',' && depth === 0) {
+      commas += 1
+      if (commas === 3) {
+        fourth = text.slice(index + 1).split(')')[0].split(',')[0].trim()
+        break
+      }
+    }
+  }
+  if (fourth === 'ctx') {
+    wrongArgument += 1
+    console.log(`  FAIL sendJson called with ctx as settings: ${text.trim().slice(0, 70)}`)
+  }
+}
+if (wrongArgument === 0) {
+  console.log(`  ok   ${sendJsonCalls.length} sendJson calls use a settings argument`)
+} else {
+  failures += wrongArgument
+}
+
 process.exitCode = failures === 0 ? 0 : 1
