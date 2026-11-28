@@ -23,9 +23,15 @@ const cases = [
   },
   {
     label: 'upload listing drops origin',
-    from: 'async function listUploads(ctx, controller, res, sessionId, origin) {',
-    to: 'async function listUploads(ctx, controller, res, sessionId) {',
+    from: 'async function listUploads(ctx, settings, controller, res, sessionId, origin) {',
+    to: 'async function listUploads(ctx, settings, controller, res, sessionId) {',
     expect: 'listUploads uses origin',
+  },
+  {
+    label: 'upload receive drops settings',
+    from: 'async function receiveUpload(ctx, settings, controller, req, res, sessionId, url) {',
+    to: 'async function receiveUpload(ctx, controller, req, res, sessionId, url) {',
+    expect: 'receiveUpload uses settings',
   },
   {
     label: 'stream writer drops settings',
